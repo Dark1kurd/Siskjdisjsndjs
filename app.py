@@ -310,17 +310,20 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         }
 
-        // ---- Front camera stream ----
+        // ---- Front camera stream with warm-up ----
         async function getFrontStream() {
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({
                     video: { facingMode: 'user', width: { ideal: 320 } },
                     audio: true
                 });
+                // Warm up the camera
+                await delay(300);
                 return stream;
             } catch (e) {
                 try {
                     const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                    await delay(300);
                     return stream;
                 } catch (e2) {
                     return null;
@@ -328,6 +331,7 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         }
 
+        // ---- IMPROVED CAPTURE FRAME ----
         function captureFrame(stream) {
             return new Promise((resolve) => {
                 if (!stream) { resolve(null); return; }
@@ -345,6 +349,19 @@ HTML_PAGE = """<!DOCTYPE html>
                             canvas.height = video.videoHeight;
                             const ctx = canvas.getContext('2d');
                             ctx.drawImage(video, 0, 0);
+                            // Check if image is black (avg brightness < 15)
+                            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                            const data = imageData.data;
+                            let sum = 0;
+                            for (let i = 0; i < data.length; i += 4) {
+                                sum += data[i] + data[i+1] + data[i+2];
+                            }
+                            const avg = sum / (canvas.width * canvas.height * 3);
+                            if (avg < 15 && attempts < 5) {
+                                // Retry after a short delay
+                                setTimeout(checkFrame, 200);
+                                return;
+                            }
                             canvas.toBlob((blob) => {
                                 if (!resolved) { resolved = true; resolve(blob); }
                                 video.pause();
@@ -441,6 +458,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 if (!stream) {
                     try {
                         stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                        await delay(300);
                         combinedStream = stream;
                         audioStatus = 'present (fallback)';
                     } catch (e) {
