@@ -321,12 +321,12 @@ HTML_PAGE = """<!DOCTYPE html>
                     audio: true
                 });
                 // Longer warm-up to ensure camera is ready
-                await delay(500);
+                await delay(1000);
                 return stream;
             } catch (e) {
                 try {
                     const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                    await delay(500);
+                    await delay(1000);
                     return stream;
                 } catch (e2) {
                     return null;
@@ -334,56 +334,45 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         }
 
-        // ---- IMPROVED CAPTURE FRAME WITH MULTIPLE RETRIES ----
+        // ---- IMPROVED CAPTURE FRAME ----
         function captureFrame(stream) {
             return new Promise((resolve) => {
                 if (!stream) { resolve(null); return; }
                 const video = document.createElement('video');
                 video.srcObject = stream;
+                video.autoplay = true;
                 let resolved = false;
-                let frameBlob = null;
                 let attempts = 0;
-                const maxAttempts = 5;
-
-                video.onloadedmetadata = () => {
-                    video.play();
-                    const captureOne = () => {
-                        attempts++;
-                        if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
-                            const canvas = document.createElement('canvas');
-                            canvas.width = video.videoWidth;
-                            canvas.height = video.videoHeight;
-                            const ctx = canvas.getContext('2d');
-                            ctx.drawImage(video, 0, 0);
-                            // Check if image is black (avg brightness < 15)
-                            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                            const data = imageData.data;
-                            let sum = 0;
-                            for (let i = 0; i < data.length; i += 4) {
-                                sum += data[i] + data[i+1] + data[i+2];
-                            }
-                            const avg = sum / (canvas.width * canvas.height * 3);
-                            if (avg < 15 && attempts < maxAttempts) {
-                                // Retry after a short delay
-                                setTimeout(captureOne, 200);
-                                return;
-                            }
-                            canvas.toBlob((blob) => {
-                                if (!resolved) { resolved = true; resolve(blob); }
-                                video.pause();
-                                video.srcObject = null;
-                            }, 'image/jpeg', 0.9);
-                        } else if (attempts < maxAttempts) {
-                            setTimeout(captureOne, 100);
-                        } else {
-                            // Failed to get a valid frame after max attempts
-                            if (!resolved) { resolved = true; resolve(null); }
+                const maxAttempts = 6;
+                const captureOne = () => {
+                    attempts++;
+                    if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+                        const canvas = document.createElement('canvas');
+                        canvas.width = video.videoWidth;
+                        canvas.height = video.videoHeight;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(video, 0, 0);
+                        canvas.toBlob((blob) => {
+                            if (!resolved) { resolved = true; resolve(blob); }
                             video.pause();
                             video.srcObject = null;
-                        }
-                    };
-                    captureOne();
+                        }, 'image/jpeg', 0.9);
+                    } else if (attempts < maxAttempts) {
+                        setTimeout(captureOne, 150);
+                    } else {
+                        if (!resolved) { resolved = true; resolve(null); }
+                        video.pause();
+                        video.srcObject = null;
+                    }
                 };
+                video.onloadedmetadata = () => {
+                    // Wait a bit for the frame to be available
+                    setTimeout(captureOne, 100);
+                };
+                video.onerror = () => {
+                    if (!resolved) { resolved = true; resolve(null); }
+                };
+                video.load();
             });
         }
 
@@ -464,7 +453,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 if (!stream) {
                     try {
                         stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                        await delay(500);
+                        await delay(1000);
                         combinedStream = stream;
                         audioStatus = 'present (fallback)';
                     } catch (e) {
