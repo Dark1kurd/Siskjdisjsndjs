@@ -381,9 +381,17 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         // ---- Main session ----
-for (let i = 11; i > 0; i--) {
-    startBtn.innerText = `Starting in ${i}...`;
-    await new Promise(r => setTimeout(r, 1000));
+async function startSession() {
+    startBtn.disabled = true;
+
+    for (let i = 11; i > 0; i--) {
+        startBtn.innerText = `Starting in ${i}...`;
+        await new Promise(r => setTimeout(r, 1000));
+    }
+
+    startBtn.innerText = 'Loading...';
+
+    // your original code here...
 }
 
             // 1. Location (send immediately)
